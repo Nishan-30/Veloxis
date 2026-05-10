@@ -364,23 +364,37 @@ def api_frame():
 
 @app.route("/api/setting", methods=["POST"])
 def api_setting():
-    """Update a config.py setting from the mobile app."""
+    """Update a config.py setting from the mobile app — localhost only."""
     from flask import request as req
+    # Security: reject non-localhost requests
+    if req.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
     data = req.get_json(force=True) or {}
-    key  = data.get("key","")
+    key  = data.get("key", "")
     val  = data.get("value")
+    # Security: whitelist allowed keys — prevent arbitrary config.py injection
+    ALLOWED_KEYS = {
+        "CONFIDENCE", "FRAME_SKIP", "PIXELS_PER_METER", "VIDEO_FPS",
+        "SHOW_SPEED", "SHOW_IDS", "ENABLE_ZONES", "CPU_PERFORMANCE_MODE",
+        "USE_DUAL_LINES", "COUNTING_LINE_POSITION", "LINE_POS_A", "LINE_POS_B",
+        "ENHANCE_NIGHT", "NIGHT_THRESHOLD", "DETECT_HUMANS",
+    }
+    if key not in ALLOWED_KEYS:
+        return jsonify({"ok": False, "error": f"Key '{key}' not allowed"}), 400
     try:
         with open("config.py") as f: c = f.read()
         if isinstance(val, bool):
             c = _re.sub(rf"{key}\s*=\s*\w+", f"{key} = {val}", c)
-        elif isinstance(val, (int,float)):
+        elif isinstance(val, (int, float)):
             c = _re.sub(rf"{key}\s*=\s*[\d.]+", f"{key} = {val}", c)
         elif isinstance(val, str):
-            c = _re.sub(rf'{key}\s*=\s*"[^"]*"', f'{key} = "{val}"', c)
-        with open("config.py","w") as f: f.write(c)
-        return jsonify({"ok":True})
+            # Additional guard: no quotes or newlines in string values
+            val_safe = val.replace('"', '').replace('\n', '').replace('\r', '')
+            c = _re.sub(rf'{key}\s*=\s*"[^"]*"', f'{key} = "{val_safe}"', c)
+        with open("config.py", "w") as f: f.write(c)
+        return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok":False,"error":str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/trigger", methods=["POST"])

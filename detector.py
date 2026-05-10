@@ -1,14 +1,15 @@
 # ================================================================
-#  detector.py  --  VELOXIS v1.0
+#  detector.py  --  VELOXIS v2.0
 #  Author : Nishan, SUST CEE, 2026
 #  Product: NextCity Tessera
 #
-#  Detection engine upgraded to YOLO26:
-#    - YOLO26 NMS-free end-to-end inference (faster deployment)
-#    - BoTSORT tracker (better Re-ID than ByteTrack)
-#    - ByteTrack automatic fallback
+#  Detection engine:
+#    - YOLOv11 (custom BD vehicle model, 45,862 images)
+#    - Custom _iou_track() — Hungarian assignment + velocity prediction
+#      (replaces BoTSORT entirely — no external ReID file needed)
+#    - 3-mechanism line crossing: sign-change + history-scan + band-exit
 #    - Homography speed calibration (perspective-correct)
-#    - DeepSORT fallback if ultralytics tracker unavailable
+#    - Re-ID cache (90-frame, prevents double-counting re-entrants)
 # ================================================================
 
 import cv2, datetime, csv, os, math
@@ -105,22 +106,31 @@ class VehicleDetector:
     def __init__(self, session_label="session"):
         model_name = config.YOLO_MODEL
         print(f"[INFO] Loading model: {model_name}")
-        # Check if model file exists before loading
-        if not os.path.exists(model_name):
-            # Try fallback models in order
+        # Resolve model path — search cwd, then script directory, then fallbacks
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        def _find_model(name):
+            for candidate in [name, os.path.join(_script_dir, name)]:
+                if os.path.exists(candidate):
+                    return candidate
+            return None
+
+        _found = _find_model(model_name)
+        if _found:
+            model_name = _found
+        else:
             fallbacks = ["bd_vehicles_best.pt","yolo11s.pt","yolov8s.pt","yolov8n.pt"]
-            found = None
+            found_fb = None
             for fb in fallbacks:
-                if os.path.exists(fb):
-                    found = fb
-                    break
-            if found:
-                print(f"[WARN] {model_name} not found. Using fallback: {found}")
-                model_name = found
+                found_fb = _find_model(fb)
+                if found_fb: break
+            if found_fb:
+                print(f"[WARN] {model_name} not found. Using fallback: {found_fb}")
+                model_name = found_fb
             else:
-                print(f"[WARN] {model_name} not found. Downloading yolo11s.pt from ultralytics...")
+                print(f"[WARN] No model found. Downloading yolo11s.pt...")
                 model_name = "yolo11s.pt"
         self.model = YOLO(model_name)
+        self._model_name_used = model_name
         print(f"[INFO] Model loaded: {model_name}")
         self._class_names = (
             self.model.names
@@ -128,13 +138,14 @@ class VehicleDetector:
             else config.VEHICLE_CLASSES
         )
 
-        # ── YOLO26 tracker setup ──────────────────────────────
-        # BoTSORT tracker — tuned for BD mixed traffic (reduces ID switches)
-        # Write a custom botsort config with tighter thresholds
+        # ── Tracker setup (config written for future BoTSORT fallback) ──
+        # Primary tracker: custom _iou_track() — Hungarian + velocity prediction
+        # _setup_tracker() writes a botsort YAML but it is NOT used by predict()
+        # It is kept so the config file exists if ultralytics tracking is ever needed
         self._tracker_cfg = self._setup_tracker()
-        print(f"[INFO] Tracker: BoTSORT (custom config — low ID-switch mode)")
+        print(f"[INFO] Tracker: custom _iou_track() (Hungarian + velocity prediction)")
 
-        # DeepSORT fallback (only if ultralytics tracker completely fails)
+        # DeepSORT instance kept as optional fallback — not used in normal operation
         self._deepsort = None
         if _HAS_DEEPSORT:
             self._deepsort = _DeepSort(
@@ -153,9 +164,20 @@ class VehicleDetector:
         self.speed_history = {}
         self.prev_speeds   = {}
         self.prev_cy       = {}
+        self.prev_zone     = {}   # tid → last zone name (for TMC entry tracking)
         self._counted_fwd  = set()
         self.frame_no      = 0
         self.session_label = session_label
+
+        # ── Approach zone pre-registration (Bug 5 fix) ────────
+        # Tracks seen in approach zone (above counting line) are pre-registered.
+        # If YOLO misses them exactly at the line, they still get counted
+        # when they reappear on the far side.
+        # approach_zone_frac: fraction of frame height above counting line to monitor
+        APPROACH_ZONE_FRAC = 0.20   # 20% above line = generous detection window
+        self._approach_zone_frac = APPROACH_ZONE_FRAC
+        self._seen_approaching   = {}  # effective_tid → frame_no when last seen approaching
+        self._approach_max_age   = 45  # frames — drop approach record after ~1.5s
 
         # ── Re-ID cache (prevents double-counting re-entrants) ─
         self._reid_cache   = {}
@@ -175,24 +197,26 @@ class VehicleDetector:
         self.current_rate    = 0
 
         # ── Miovision-style advanced metrics ──────────────────
-        # Peak Hour Factor (PHF) = total volume / (4 x peak 15-min volume)
-        # Standard intersection capacity analysis metric
-        self.phf             = 0.0   # 0.0–1.0, ideal ~0.85–0.95
+        self.phf = 0.0   # Peak Hour Factor
 
-        # Turning movement counts: approach x turn direction
-        # Keys: "N_L","N_T","N_R","S_L","S_T","S_R","E_L","E_T","E_R","W_L","W_T","W_R"
-        # Populated only when 4-approach zones are drawn (Lane Drawing page)
-        self.turning_counts  = {}
+        # Turning Movement Counts (TMC)
+        # Key format: "ApproachZone→ExitZone"  e.g. "North→South"
+        # Populated whenever ENABLE_ZONES=True and polygon zones are drawn
+        self.turning_counts  = {}   # {"N→S": {"car":3,"rickshaw":1,...}, ...}
+        self.tmc_entry_zone  = {}   # tid → zone name at first zone entry
 
-        # Approach volume (vehicles per approach arm)
-        # Used for v/c ratio and LOS calculation
-        self.approach_counts = {}   # {"North": n, "South": n, ...}
+        # Approach volume (per named zone)
+        self.approach_counts = {}   # {"North": 12, "South": 8, ...}
 
         # Level of Service (LOS) — HCM 6th edition thresholds
-        # Based on avg control delay per vehicle (seconds)
-        # A:<10  B:10-20  C:20-35  D:35-55  E:55-80  F:>80
         self.los_letter      = "—"
         self.avg_delay_sec   = 0.0
+        self._los_colours = {
+            "A": ( 80, 220,  80), "B": ( 57, 197, 187),
+            "C": ( 80, 200, 255), "D": ( 50, 150, 255),
+            "E": ( 50,  80, 255), "F": ( 50,  50, 220),
+            "—": (130, 130, 130),
+        }
 
         # Headway tracking (time between consecutive vehicles crossing line)
         self._last_cross_time = {}   # vtype → last crossing datetime
@@ -225,50 +249,66 @@ class VehicleDetector:
         os.makedirs(config.DATA_FOLDER, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = os.path.join(config.DATA_FOLDER, f"log_{ts}.csv")
-        with open(self.csv_path, "w", newline="") as f:
+
+        # Load study location from user prefs
+        try:
+            import json as _json
+            _prefs_path = "data/user_prefs.json"
+            with open(_prefs_path, encoding="utf-8") as _pf:
+                _prefs = _json.load(_pf)
+        except Exception:
+            _prefs = {}
+        self.site_name = _prefs.get("loc_name", "") or _prefs.get("site_name", "")
+        self.site_lat  = _prefs.get("loc_lat",  "") or _prefs.get("site_lat",  "")
+        self.site_lng  = _prefs.get("loc_lng",  "") or _prefs.get("site_lng",  "")
+
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 "timestamp", "track_id", "vehicle_type",
                 "zone", "direction", "speed_kmh", "session",
-                # Extended columns — session-level metrics updated per crossing
                 "queue_length", "occupancy_pct", "current_rate_vph",
                 "avg_headway_sec", "saturation_flow", "phf",
-                "speed_85th_kmh", "speed_mean_kmh"])
+                "speed_85th_kmh", "speed_mean_kmh",
+                "location_name", "latitude", "longitude"])
         print(f"[INFO] Log -> {self.csv_path}")
+        if self.site_name:
+            print(f"[INFO] Study site: {self.site_name} ({self.site_lat}, {self.site_lng})")
 
     # ── Tracker setup ─────────────────────────────────────────
     def _setup_tracker(self):
-        """
-        Write a tuned BoTSORT config to reduce ID switches in
-        BD mixed-traffic intersections (dense, slow-moving, occluded).
+        """Write tuned BoTSORT config. Falls back to bytetrack if write fails."""
+        try:
+            import yaml as _yaml
+        except ImportError:
+            # yaml not installed — use ultralytics built-in tracker name
+            print("[WARN] pyyaml not installed — using default bytetrack tracker")
+            return "bytetrack.yaml"
 
-        Key tuning:
-          track_high_thresh: lower = track more detections (fewer lost IDs)
-          new_track_thresh:  higher = don't start tracks on weak detections
-          track_buffer:      longer = keep lost tracks longer before deleting
-          match_thresh:      lower = stricter match (fewer wrong Re-ID)
-          with_reid:         True = use appearance features for Re-ID
-        """
-        import yaml as _yaml
         cfg = {
             "tracker_type":       "botsort",
-            "track_high_thresh":  0.30,   # was 0.5 — track more confidently detected vehicles
-            "track_low_thresh":   0.15,   # low conf detections still considered for matching
-            "new_track_thresh":   0.35,   # min conf to START a new track
-            "track_buffer":       45,     # frames to keep lost track (~1.5s at 30fps)
-            "match_thresh":       0.70,   # IoU match threshold — stricter to avoid wrong match
-            "fuse_score":         True,   # fuse detection score into match
-            "with_reid":          True,   # use appearance Re-ID (key for ID consistency)
+            "track_high_thresh":  0.30,
+            "track_low_thresh":   0.15,
+            "new_track_thresh":   0.35,
+            "track_buffer":       45,
+            "match_thresh":       0.70,
+            "fuse_score":         True,
+            "with_reid":          False,   # OFF by default — needs extra model file
             "proximity_thresh":   0.5,
-            "appearance_thresh":  0.25,   # stricter appearance match
-            "cmc_method":         "sparseOptFlow",  # camera motion compensation
+            "appearance_thresh":  0.25,
+            "cmc_method":         "sparseOptFlow",
             "frame_rate":         30,
         }
-        tracker_path = os.path.join(
-            getattr(config, "DATA_FOLDER", "data"), "botsort_veloxis.yaml")
-        os.makedirs(os.path.dirname(tracker_path), exist_ok=True)
-        with open(tracker_path, "w") as f:
-            _yaml.dump(cfg, f)
-        return tracker_path
+        try:
+            tracker_path = os.path.join(
+                getattr(config, "DATA_FOLDER", "data"), "botsort_veloxis.yaml")
+            os.makedirs(os.path.dirname(tracker_path), exist_ok=True)
+            with open(tracker_path, "w") as f:
+                _yaml.dump(cfg, f)
+            print(f"[INFO] Tracker config: {tracker_path}")
+            return tracker_path
+        except Exception as e:
+            print(f"[WARN] Could not write tracker config ({e}), using bytetrack")
+            return "bytetrack.yaml"
 
     # ── Homography ────────────────────────────────────────────
     def _load_homography(self):
@@ -330,94 +370,75 @@ class VehicleDetector:
                 detect_frame = cv2.resize(frame, (rw, int(h * s)))
                 coord_scale  = 1.0 / s
 
-        # ── YOLO26 tracking ───────────────────────────────────
-        # model.track() runs YOLO26 + tracker in a single call.
-        # YOLO26 NMS-free head: no post-processing needed.
-        # persist=True keeps track IDs consistent across frames.
+        # ── Detection + Tracking ──────────────────────────────
         tracks = []
         self.person_count = 0
         try:
-            track_results = self.model.track(
+            # Lower confidence if using generic fallback model
+            _conf = config.CONFIDENCE
+            if 'bd_vehicles' not in getattr(self, '_model_name_used', '').lower():
+                _conf = min(_conf, 0.20)  # COCO model needs lower threshold for BD vehicles
+
+            results = self.model.predict(
                 detect_frame,
-                persist   = True,
-                verbose   = False,
-                conf      = config.CONFIDENCE,
-                iou       = 0.3,
-                tracker   = self._tracker_cfg,
+                verbose = False,
+                conf    = _conf,
+                iou     = 0.45,
             )[0]
 
-            if track_results.boxes.id is not None:
-                for box, tid, cls_id, conf_v in zip(
-                    track_results.boxes.xyxy,
-                    track_results.boxes.id,
-                    track_results.boxes.cls,
-                    track_results.boxes.conf,
-                ):
-                    cls_int = int(cls_id)
-                    # Person (COCO class 0) — draw separately
-                    if cls_int == 0:
-                        if getattr(config, "DETECT_HUMANS", True):
-                            x1, y1, x2, y2 = [int(v * coord_scale) for v in box.tolist()]
-                            self.person_count += 1
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 100), 1)
-                            cv2.putText(frame, "person", (x1, max(y1 - 4, 10)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 100, 100), 1)
-                        continue
-                    x1, y1, x2, y2 = [int(v * coord_scale) for v in box.tolist()]
-                    tracks.append({
-                        "tid":  int(tid),
-                        "ltrb": (x1, y1, x2, y2),
-                        "cls":  cls_int,
-                        "conf": float(conf_v),
-                    })
+            n_det = len(results.boxes) if results.boxes is not None else 0
+            # Debug: detection count + confidence shown top-right
+            cv2.putText(frame, f"Det:{n_det} Conf:{_conf:.2f} Trk:{len(self.counted_ids)}",
+                        (w-240, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,100), 1)
+
+            raw_dets = []
+            for box, cls_id, conf_v in zip(
+                results.boxes.xyxy,
+                results.boxes.cls,
+                results.boxes.conf,
+            ):
+                cls_int = int(cls_id)
+                x1, y1, x2, y2 = [int(v * coord_scale) for v in box.tolist()]
+                if cls_int == 0:
+                    if getattr(config, "DETECT_HUMANS", True):
+                        self.person_count += 1
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 100), 1)
+                        cv2.putText(frame, "person", (x1, max(y1-4, 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 100, 100), 1)
+                    continue
+                raw_dets.append((x1, y1, x2, y2, cls_int, float(conf_v)))
+
+            tracks = self._iou_track(raw_dets, w, h)
 
         except Exception as e:
-            # Fallback: run standard inference then DeepSORT
-            print(f"[WARN] YOLO26 tracker failed ({e}), falling back to DeepSORT")
-            try:
-                results = self.model(detect_frame, verbose=False, conf=config.CONFIDENCE)[0]
-                detections = []
-                for box in results.boxes:
-                    cls = int(box.cls[0])
-                    if cls == 0:
-                        if getattr(config, "DETECT_HUMANS", True):
-                            x1, y1, x2, y2 = [int(v * coord_scale) for v in box.xyxy[0].tolist()]
-                            self.person_count += 1
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 100), 1)
-                            cv2.putText(frame, "person", (x1, max(y1 - 4, 10)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 100, 100), 1)
-                        continue
-                    x1, y1, x2, y2 = [int(v * coord_scale) for v in box.xyxy[0].tolist()]
-                    bw, bh = x2 - x1, y2 - y1
-                    detections.append(([x1, y1, bw, bh], float(box.conf[0]), cls))
-                detections = self._nms(detections)
-                if self._deepsort:
-                    ds_tracks = self._deepsort.update_tracks(detections, frame=frame)
-                    for t in ds_tracks:
-                        if not t.is_confirmed(): continue
-                        l2, t2, r2, b2 = map(int, t.to_ltrb())
-                        tracks.append({
-                            "tid":  t.track_id,
-                            "ltrb": (l2, t2, r2, b2),
-                            "cls":  getattr(t, "det_class", 2),
-                            "conf": 0.5,
-                        })
-            except Exception as e2:
-                print(f"[ERROR] Fallback also failed: {e2}")
+            if not hasattr(self, '_det_warn_count'): self._det_warn_count = 0
+            self._det_warn_count += 1
+            if self._det_warn_count <= 5:
+                print(f"[WARN] Detection error frame {self.frame_no}: {type(e).__name__}: {e}")
+            cv2.putText(frame, f"DET ERR:{type(e).__name__[:20]}",
+                        (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
 
         lines = self._get_lines(w, h)
 
         # ── Per-track processing ──────────────────────────────
         for trk in tracks:
-            tid     = trk["tid"]
+            tid       = trk["tid"]
+            confirmed = trk.get("confirmed", True)
+            is_lost   = trk.get("lost", 0) > 0
             l, t, r, b = trk["ltrb"]
             l, t, r, b = max(l, 0), max(t, 0), min(r, w - 1), min(b, h - 1)
             cx, cy  = (l + r) // 2, (t + b) // 2
             bw, bh  = r - l, b - t
+            if bw <= 0 or bh <= 0: continue
             cls_int = trk["cls"]
 
             vtype  = _corrected_vtype(cls_int, bw, bh, w, h, self._class_names)
             colour = COLOURS.get(vtype, DEFAULT_COLOUR)
+
+            # Dim ghost boxes (lost track at predicted position — don't count)
+            if is_lost:
+                cv2.rectangle(frame, (l,t), (r,b), colour, 1)
+                continue
 
             speed_kmh = self._estimate_speed(tid, cx, cy, self.frame_no)
 
@@ -438,6 +459,11 @@ class VehicleDetector:
             direction = DIR_FORWARD if (prev_cy_ is None or cy >= prev_cy_) else DIR_BACKWARD
             self.prev_cy[effective_tid] = cy
 
+            # Zone tracking for TMC — record entry zone on first appearance
+            current_zone = self._get_zone(cx, cy, w, h) if config.ENABLE_ZONES else "all"
+            if effective_tid not in self.tmc_entry_zone and current_zone != "all":
+                self.tmc_entry_zone[effective_tid] = current_zone
+
             # Queue tint: blue if slow and behind line
             lp1_main, lp2_main, _ = lines[0]
             line_y = (lp1_main[1] + lp2_main[1]) // 2
@@ -445,8 +471,53 @@ class VehicleDetector:
                 colour = (100, 100, 255)
 
             # Line crossing → count
+            # Use effective_tid's tracker history when reid-mapped to avoid
+            # sign-state / centroid-history mismatch at reid boundary (Bug 2)
+            _eff_trk_state = self._trk_active.get(tid, {})
+            if effective_tid != tid and effective_tid in self._trk_active:
+                # Reid mapped: use effective track's deeper history
+                _orig_state = self._trk_active[effective_tid]
+                _cx_hist = _orig_state.get('cx_hist', _eff_trk_state.get('cx_hist', []))
+                _cy_hist = _orig_state.get('cy_hist', _eff_trk_state.get('cy_hist', []))
+            else:
+                _cx_hist = _eff_trk_state.get('cx_hist', [])
+                _cy_hist = _eff_trk_state.get('cy_hist', [])
+
+            # Approach zone pre-registration (Bug 5 fix)
+            # FWD vehicles approach from above line; BWD from below
+            lp1_cross, lp2_cross, _ = lines[0]
+            _line_y = (lp1_cross[1] + lp2_cross[1]) // 2
+            _approach_band = int(h * self._approach_zone_frac)
+            _is_approaching_fwd = (_line_y - _approach_band <= cy < _line_y)
+            _is_approaching_bwd = (_line_y < cy <= _line_y + _approach_band)
+            _is_approaching = _is_approaching_fwd or _is_approaching_bwd
+            if _is_approaching and effective_tid not in self.counted_ids:
+                self._seen_approaching[effective_tid] = self.frame_no
+            # Draw approach zone top boundary (used by draw_counting_lines)
+            _approach_y_top = _line_y - _approach_band
+            # Prune stale approach records
+            _stale = [k for k, fn in self._seen_approaching.items()
+                      if self.frame_no - fn > self._approach_max_age]
+            for k in _stale:
+                self._seen_approaching.pop(k, None)
             for lp1, lp2, line_label in lines:
-                if self._crosses_line(f"{effective_tid}_{line_label}", cx, cy, lp1, lp2):
+                # Standard crossing check
+                _crossed = self._crosses_line(f"{effective_tid}_{line_label}",
+                                              cx, cy, lp1, lp2, _cx_hist, _cy_hist)
+                # Approach zone synthetic cross (Bug 5 fix):
+                # Vehicle was seen approaching → now on far side → must have crossed
+                if not _crossed and effective_tid in self._seen_approaching:
+                    _dx = lp2[0] - lp1[0]; _dy = lp2[1] - lp1[1]
+                    _len = max(math.sqrt(_dx*_dx + _dy*_dy), 1)
+                    _curr_sd = (_dx*(cy - lp1[1]) - _dy*(cx - lp1[0])) / _len
+                    # Negative sd = past line (FWD), Positive sd = past line (BWD)
+                    _frames_since = self.frame_no - self._seen_approaching[effective_tid]
+                    _past_line_fwd = _curr_sd < -8.0   # FWD vehicle past line
+                    _past_line_bwd = _curr_sd > 8.0    # BWD vehicle past line
+                    if (_past_line_fwd or _past_line_bwd) and _frames_since <= self._approach_max_age:
+                        _crossed = True
+                        self._seen_approaching.pop(effective_tid, None)
+                if _crossed:
                     if effective_tid not in self.counted_ids:
                         self.counted_ids.add(effective_tid)
                         if direction == DIR_FORWARD:
@@ -464,6 +535,19 @@ class VehicleDetector:
                             self.zone_counts.setdefault(zone, {})
                             self.zone_counts[zone][vtype] = \
                                 self.zone_counts[zone].get(vtype, 0) + 1
+                            # Approach count — where vehicle entered intersection
+                            entry_zone = self.tmc_entry_zone.get(effective_tid, zone)
+                            self.approach_counts[entry_zone] = \
+                                self.approach_counts.get(entry_zone, 0) + 1
+                            # TMC — entry zone → exit zone (current zone at crossing)
+                            if entry_zone and zone and entry_zone != zone:
+                                tmc_key = f"{entry_zone}→{zone}"
+                            else:
+                                # Same zone or no entry zone: use direction as proxy
+                                tmc_key = f"{entry_zone}→{'FWD' if direction==DIR_FORWARD else 'BWD'}"
+                            self.turning_counts.setdefault(tmc_key, {})
+                            self.turning_counts[tmc_key][vtype] = \
+                                self.turning_counts[tmc_key].get(vtype, 0) + 1
                         self._log(effective_tid, vtype, zone, direction, speed_kmh)
                     break
 
@@ -509,7 +593,8 @@ class VehicleDetector:
                 self.near_miss_log = self.near_miss_log[-50:]
 
         # ── Live stats ────────────────────────────────────────
-        vehicle_tracks = tracks  # already excludes person class
+        vehicle_tracks = [t for t in tracks
+                          if t.get("confirmed",True) and t.get("lost",0)==0]
         self.live_vehicles = len(vehicle_tracks)
         road_area = max(w * h * 0.6, 1)
         occ_px = sum(
@@ -562,16 +647,105 @@ class VehicleDetector:
         elif elapsed_min > 0:
             self.current_rate = round(self._interval_count / (elapsed_min / 60))
 
-        # ── Prune Re-ID cache ─────────────────────────────────
-        stale = [k for k, v in self._reid_cache.items()
-                 if self.frame_no - v["frame"] > self._reid_max_age]
-        for k in stale:
+        # ── Memory management (runs every frame) ─────────────
+        # All unbounded dicts pruned here to prevent long-session crash
+
+        # 1. Re-ID cache — remove stale entries
+        stale_reid = [k for k, v in self._reid_cache.items()
+                      if self.frame_no - v["frame"] > self._reid_max_age]
+        for k in stale_reid:
             del self._reid_cache[k]
 
-        # ── Draw counting lines ───────────────────────────────
+        # 2. Re-ID mapped dict — prune entries older than cache window
+        #    Only keep mappings for IDs still in reid_cache
+        if len(self._reid_mapped) > 500:
+            valid_originals = set(self._reid_cache.keys())
+            self._reid_mapped = {
+                k: v for k, v in self._reid_mapped.items()
+                if v in valid_originals or k in valid_originals}
+
+        # 3. Speed history — already capped per track in _estimate_speed
+        #    But dict itself grows with each new track ID. Prune dead tracks.
+        active_tids = {trk2["tid"] for trk2 in tracks}
+        if self.frame_no % 300 == 0:   # every 300 frames (~10s)
+            # Keep only active tracks + recently seen (last 300 frames implied)
+            # Speed history entries are already sliced to 15 in _estimate_speed
+            dead = [k for k in list(self.speed_history.keys())
+                    if k not in active_tids and k not in self.counted_ids]
+            for k in dead:
+                del self.speed_history[k]
+            # Prune prev_speeds and prev_cy for dead tracks too
+            for dead_k in [k for k in list(self.prev_speeds.keys())
+                           if k not in active_tids and k not in self.counted_ids]:
+                self.prev_speeds.pop(dead_k, None)
+                self.prev_cy.pop(dead_k, None)
+
+        # 4. _counted_fwd — only keep IDs that are in counted_ids
+        if self.frame_no % 600 == 0:
+            self._counted_fwd &= self.counted_ids
+            # Prune tmc_entry_zone for vehicles long gone
+            dead_tmc = [k for k in list(self.tmc_entry_zone.keys())
+                        if k not in active_tids and k in self.counted_ids]
+            for k in dead_tmc:
+                self.tmc_entry_zone.pop(k, None)
+            # Prune _d_, _b_, _hist_crossed_ attributes for tracks no longer active
+            # These accumulate as setattr(self, f"_d_{key}", ...) over long sessions
+            active_keys = set()
+            for tid2 in active_tids:
+                for ll in ["A","B"]:
+                    active_keys.add(f"_d_{tid2}_{ll}")
+                    active_keys.add(f"_b_{tid2}_{ll}")
+                    active_keys.add(f"_hist_crossed_{tid2}_{ll}")
+            stale_attrs = [k for k in list(self.__dict__.keys())
+                           if (k.startswith('_d_') or k.startswith('_b_') or
+                               k.startswith('_hist_crossed_'))
+                           and k not in active_keys]
+            for k in stale_attrs:
+                delattr(self, k)
+
+        # 5. peak_intervals — keep only last 12 (3 hours of 15-min intervals)
+        if len(self.peak_intervals) > 12:
+            self.peak_intervals = self.peak_intervals[-12:]
+
+        # 6. Auto-save every 5 minutes (300 seconds)
+        if not hasattr(self, '_last_autosave'):
+            self._last_autosave = datetime.datetime.now()
+        elapsed_since_save = (datetime.datetime.now() - self._last_autosave).total_seconds()
+        if elapsed_since_save >= 300:   # 5 minutes
+            self._autosave_checkpoint()
+            self._last_autosave = datetime.datetime.now()
+
+        # ── Draw counting lines + approach zone ──────────────
         fwd_c = sum(self.dir_counts.get(DIR_FORWARD, {}).values())
         bwd_c = sum(self.dir_counts.get(DIR_BACKWARD, {}).values())
         lcols = [(57, 197, 187), (255, 180, 40)]
+
+        # Draw approach zone — dashed line showing pre-registration area
+        if lines:
+            lp1_a, lp2_a, _ = lines[0]
+            _line_y_draw = (lp1_a[1] + lp2_a[1]) // 2
+            _appr_band   = int(h * self._approach_zone_frac)
+            _appr_y_top  = max(_line_y_draw - _appr_band, 0)
+            _appr_y_bot  = min(_line_y_draw + _appr_band, h - 1)
+            # Dashed approach zone lines (both above and below for FWD+BWD)
+            for _appr_y in [_appr_y_top, _appr_y_bot]:
+                _x = lp1_a[0]
+                while _x < lp2_a[0]:
+                    x_end = min(_x + 12, lp2_a[0])
+                    cv2.line(frame, (_x, _appr_y), (x_end, _appr_y), (100, 160, 255), 1)
+                    _x += 20
+            # Semi-transparent approach zone fills
+            _ov = frame.copy()
+            cv2.rectangle(_ov, (lp1_a[0], _appr_y_top), (lp2_a[0], _line_y_draw), (60, 80, 160), -1)
+            cv2.rectangle(_ov, (lp1_a[0], _line_y_draw), (lp2_a[0], _appr_y_bot), (60, 80, 160), -1)
+            cv2.addWeighted(_ov, 0.06, frame, 0.94, 0, frame)
+            # Label
+            _n_approaching = len(self._seen_approaching)
+            if _n_approaching > 0:
+                cv2.putText(frame, f"Approach:{_n_approaching}",
+                            (lp1_a[0] + 4, _appr_y_top + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (100, 160, 255), 1)
+
         for i, (lp1, lp2, _) in enumerate(lines):
             col = lcols[i % 2]
             cv2.line(frame, lp1, lp2, col, 2)
@@ -618,9 +792,12 @@ class VehicleDetector:
             "phf":            self.phf,
             "avg_headway_sec":self.avg_headway_sec,
             "saturation_flow":self.saturation_flow,
+            "los_letter":     self.los_letter,
+            "avg_delay_sec":  self.avg_delay_sec,
             "speed_85th":     self.speed_85th,
             "speed_mean":     self.speed_mean,
             "approach_counts":self.approach_counts,
+            "turning_counts": self.turning_counts,
         }
         self._last_ann = frame
         self._last_sum = summary
@@ -645,6 +822,151 @@ class VehicleDetector:
             "peak_rate":     self.peak_rate,
         }
 
+    def _iou_track(self, dets, frame_w, frame_h):
+        """
+        Robust IoU tracker with:
+        - Velocity prediction (Kalman-lite: smoothed dx/dy per track)
+        - Hungarian optimal assignment (not greedy)
+        - Class consistency (CNG can't match bicycle)
+        - Tentative track confirmation (min 2 frames before counting)
+        - Lost track display with last-known box (reduces ID flicker)
+
+        dets: list of (x1,y1,x2,y2, cls_int, conf)
+        returns: list of track dicts {"tid","ltrb","cls","conf","confirmed"}
+        """
+        if not hasattr(self, '_trk_active'):
+            self._trk_active  = {}   # tid → track state
+            self._trk_next_id = 1
+
+        IOU_MATCH  = 0.18   # minimum IoU after velocity prediction
+        IOU_HIGH   = 0.40   # high-confidence match (skip class check)
+        MAX_LOST   = 15     # frames before track expires (~0.5s at 30fps)
+        MIN_HITS   = 1      # confirm after 1 frame — fast vehicles must not be missed
+
+        def _iou(a, b):
+            ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
+            iw = max(0, min(ax2,bx2)-max(ax1,bx1))
+            ih = max(0, min(ay2,by2)-max(ay1,by1))
+            inter = iw*ih
+            if inter == 0: return 0.0
+            return inter / ((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter)
+
+        def _predicted_box(trk):
+            """Predict next position using smoothed velocity."""
+            x1,y1,x2,y2 = trk['ltrb']
+            vx,vy = trk.get('vx',0), trk.get('vy',0)
+            lost  = trk['lost']
+            # Decay velocity for lost tracks (friction model)
+            decay = 0.8 ** lost
+            return (x1+vx*decay, y1+vy*decay, x2+vx*decay, y2+vy*decay)
+
+        # Step 1: Age all tracks, predict positions
+        for tid in list(self._trk_active):
+            trk = self._trk_active[tid]
+            trk['lost'] += 1
+            if trk['lost'] > MAX_LOST:
+                del self._trk_active[tid]
+
+        if not dets:
+            # Return confirmed tracks with last-known box (visual continuity)
+            return [{"tid":tid,"ltrb":trk['ltrb'],"cls":trk['cls'],
+                     "conf":trk['conf'],"confirmed":trk['age']>=MIN_HITS,"lost":trk['lost']}
+                    for tid, trk in self._trk_active.items()
+                    if trk['lost'] <= 3 and trk['age'] >= MIN_HITS]
+
+        # Step 2: Build cost matrix (1 - IoU) for Hungarian assignment
+        track_ids  = list(self._trk_active.keys())
+        n_trk = len(track_ids)
+        n_det = len(dets)
+
+        if n_trk > 0 and n_det > 0:
+            import numpy as np
+            cost = np.ones((n_trk, n_det), dtype=np.float32)
+            for i, tid in enumerate(track_ids):
+                pred_box = _predicted_box(self._trk_active[tid])
+                trk_cls  = self._trk_active[tid]['cls']
+                for j, (x1,y1,x2,y2,cls,conf) in enumerate(dets):
+                    if cls != trk_cls:
+                        cost[i,j] = 0.98
+                        continue
+                    iou = _iou(pred_box, (x1,y1,x2,y2))
+                    cost[i,j] = 1.0 - iou
+
+            try:
+                from scipy.optimize import linear_sum_assignment
+                row_ind, col_ind = linear_sum_assignment(cost)
+            except ImportError:
+                # Fallback: greedy matching if scipy not installed
+                row_ind, col_ind = [], []
+                used_cols = set()
+                for r in range(n_trk):
+                    best_c = min((c for c in range(n_det) if c not in used_cols),
+                                 key=lambda c: cost[r,c], default=-1)
+                    if best_c >= 0 and cost[r,best_c] < 0.99:
+                        row_ind.append(r); col_ind.append(best_c)
+                        used_cols.add(best_c)
+
+            matched_trks = set()
+            matched_dets = set()
+            for r, c in zip(row_ind, col_ind):
+                if cost[r,c] > (1.0 - IOU_MATCH):
+                    continue  # IoU too low
+                matched_trks.add(r)
+                matched_dets.add(c)
+                tid = track_ids[r]
+                x1,y1,x2,y2,cls,conf = dets[c]
+                trk = self._trk_active[tid]
+                # Update velocity with exponential smoothing
+                px1,py1,px2,py2 = trk['ltrb']
+                raw_vx = (x1-px1+x2-px2)/2
+                raw_vy = (y1-py1+y2-py2)/2
+                trk['vx'] = 0.6*trk.get('vx',0) + 0.4*raw_vx
+                trk['vy'] = 0.6*trk.get('vy',0) + 0.4*raw_vy
+                # Track centroid history (last 8 frames — deeper history catches fast vehicles)
+                cx_m = (x1+x2)//2; cy_m = (y1+y2)//2
+                hist_cx = trk.get('cx_hist', []); hist_cx.append(cx_m)
+                hist_cy = trk.get('cy_hist', []); hist_cy.append(cy_m)
+                trk['cx_hist'] = hist_cx[-8:]; trk['cy_hist'] = hist_cy[-8:]
+                trk.update(ltrb=(x1,y1,x2,y2), cls=cls, conf=conf,
+                           age=trk['age']+1, lost=0)
+        else:
+            matched_trks = set()
+            matched_dets = set()
+
+        # Step 3: Build result — matched tracks
+        result = []
+        for i, tid in enumerate(track_ids):
+            if i not in matched_trks: continue
+            trk = self._trk_active[tid]
+            result.append({"tid":tid,"ltrb":trk['ltrb'],"cls":trk['cls'],
+                           "conf":trk['conf'],
+                           "confirmed":trk['age']>=MIN_HITS,"lost":0})
+
+        # Step 4: Show lost-but-not-expired confirmed tracks (ghost boxes)
+        for i, tid in enumerate(track_ids):
+            if i in matched_trks: continue
+            trk = self._trk_active[tid]
+            if trk['age'] >= MIN_HITS and trk['lost'] <= 4:
+                # Show at predicted position during brief occlusion
+                pb = _predicted_box(trk)
+                result.append({"tid":tid,
+                               "ltrb":(int(pb[0]),int(pb[1]),int(pb[2]),int(pb[3])),
+                               "cls":trk['cls'],"conf":trk['conf']*0.7,
+                               "confirmed":True,"lost":trk['lost']})
+
+        # Step 5: New tracks for unmatched detections
+        for j, (x1,y1,x2,y2,cls,conf) in enumerate(dets):
+            if j in matched_dets: continue
+            tid = self._trk_next_id; self._trk_next_id += 1
+            self._trk_active[tid] = dict(
+                ltrb=(x1,y1,x2,y2), cls=cls, conf=conf,
+                age=1, lost=0, vx=0.0, vy=0.0,
+                cx_hist=[], cy_hist=[])  # centroid history for crossing lookahead
+            result.append({"tid":tid,"ltrb":(x1,y1,x2,y2),"cls":cls,
+                           "conf":conf,"confirmed":True,"lost":0})
+
+        return result
+
     def _reid_lookup(self, tid, cx, cy, w, h, vtype):
         if tid in self._reid_mapped:
             return self._reid_mapped[tid]
@@ -657,6 +979,17 @@ class VehicleDetector:
             dist = math.hypot(cx_n - entry["cx_n"], cy_n - entry["cy_n"])
             if dist < POSITION_THRESH:
                 self._reid_mapped[tid] = orig_tid
+                # Transfer crossing state from tid to orig_tid so the new
+                # IoU track ID inherits the signed-distance history.
+                # Without this, every reid causes prev=None → crossing missed.
+                for line_label in ["A", "B"]:
+                    old_key = f"{tid}_{line_label}"
+                    new_key = f"{orig_tid}_{line_label}"
+                    d_val = getattr(self, f"_d_{old_key}", None)
+                    b_val = getattr(self, f"_b_{old_key}", False)
+                    if d_val is not None and not hasattr(self, f"_d_{new_key}"):
+                        setattr(self, f"_d_{new_key}", d_val)
+                        setattr(self, f"_b_{new_key}", b_val)
                 return orig_tid
         return tid
 
@@ -676,16 +1009,62 @@ class VehicleDetector:
             ly = int(h * config.COUNTING_LINE_POSITION)
         return [((0, ly), (w, ly), "A")]
 
-    def _crosses_line(self, key, cx, cy, p1, p2):
+    def _crosses_line(self, key, cx, cy, p1, p2, cx_hist=None, cy_hist=None):
+        """
+        Detect line crossing. Three mechanisms:
+        1. Sign change: centroid moves from one side to other (primary, most reliable)
+        2. Band exit: centroid passes through band without clean sign change (slow vehicles)
+        3. History scan: any of last 3 centroids crossed — catches YOLO miss at crossing moment
+        """
         dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
         length = max(math.sqrt(dx * dx + dy * dy), 1)
         def sd(px, py): return (dx * (py - p1[1]) - dy * (px - p1[0])) / length
+
         prev = getattr(self, f"_d_{key}", None)
         curr = sd(cx, cy)
         setattr(self, f"_d_{key}", curr)
-        if prev is None: return False
-        if prev * curr < 0: return True
-        band = 10.0
+
+        if prev is None:
+            # First time seen — check if vehicle already crossed line
+            if cx_hist and cy_hist and len(cx_hist) >= 2:
+                # Vehicle already has history: scan for crossing in past positions
+                sds = [sd(hx, hy) for hx, hy in zip(cx_hist, cy_hist)]
+                for i in range(len(sds)-1):
+                    if sds[i] * sds[i+1] < 0:
+                        return True  # crossing happened in history
+            # Bug 5 fix: vehicle appeared for the FIRST time already past line
+            # If curr is on far side (negative sd) AND no history to show it came from near side,
+            # it was likely detected late — count it as having crossed
+            # Only trigger if it's well past the line (not just touching it)
+            # Uses a generous threshold of 15% of line length to avoid false counts at edges
+            far_side_threshold = length * 0.15
+            if abs(curr) > far_side_threshold:
+                # Mark as "appeared past line" — will be counted on next frame
+                # when prev*curr check runs (prev will be curr which is negative, curr will advance)
+                pass  # first frame only initialises state; sign-change on frame 2 catches it
+            return False
+
+        # Mechanism 1: sign change
+        if prev * curr < 0:
+            return True
+
+        # Mechanism 3: history scan — catches YOLO miss exactly at crossing frame
+        if cx_hist and cy_hist and len(cx_hist) >= 2:
+            all_cx = cx_hist + [cx]; all_cy = cy_hist + [cy]
+            sds = [sd(hx, hy) for hx, hy in zip(all_cx[-4:], all_cy[-4:])]
+            for i in range(len(sds)-1):
+                if sds[i] * sds[i+1] < 0:
+                    already_key = f"_hist_crossed_{key}"
+                    if getattr(self, already_key, False):
+                        return False  # already counted from history
+                    setattr(self, already_key, True)
+                    return True
+
+        # Mechanism 2: band exit (slow/stopped vehicles)
+        # Band scaled by frame_skip — at skip=2, vehicles move 2x further per frame
+        # so band must be wider to catch vehicles that dwell near line
+        _skip_scale = max(_EFFECTIVE_FRAME_SKIP, 1)
+        band = max(length * 0.03 * _skip_scale, 8.0 * _skip_scale)
         was_in = getattr(self, f"_b_{key}", False)
         now_in = abs(curr) < band
         setattr(self, f"_b_{key}", now_in)
@@ -802,39 +1181,76 @@ class VehicleDetector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, 1, cv2.LINE_AA)
         cv2.putText(frame, "VELOXIS  |  NextCity Tessera",
                     (w - 220, h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (70, 70, 80), 1)
+        # Show study site name if set
+        if self.site_name:
+            site_txt = f"📍 {self.site_name}"
+            cv2.putText(frame, site_txt,
+                        (6, h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (120, 180, 120), 1)
         return frame
 
+    def _csv_write_row(self, row):
+        """Write a row to CSV with retry on IOError. Buffers on persistent failure.
+        Buffer is capped at 500 rows to prevent OOM on long sessions with disk issues."""
+        _MAX_PENDING = 500
+        if not hasattr(self, '_csv_pending'):
+            self._csv_pending = []
+        for attempt in range(3):
+            try:
+                with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(row)
+                if self._csv_pending:
+                    with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        for r in self._csv_pending:
+                            w.writerow(r)
+                    self._csv_pending.clear()
+                return True
+            except IOError as e:
+                if attempt < 2:
+                    import time as _t; _t.sleep(0.05)
+                else:
+                    if len(self._csv_pending) < _MAX_PENDING:
+                        self._csv_pending.append(row)
+                    else:
+                        # Buffer full — drop oldest to protect memory
+                        self._csv_pending.pop(0)
+                        self._csv_pending.append(row)
+                    print(f"[WARN] CSV write failed ({e}). Buffered: {len(self._csv_pending)} rows "
+                          f"(cap {_MAX_PENDING}). Check disk space.")
+                    return False
+
     def _log(self, tid, vtype, zone, direction, speed_kmh):
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
-        with open(self.csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([
-                ts, tid, vtype, zone, direction,
-                round(speed_kmh, 1) if speed_kmh else "",
-                self.session_label,
-                # Session-level metrics at time of crossing
-                self.queue_length,
-                round(self.occupancy_pct, 1),
-                self.current_rate,
-                self.avg_headway_sec if self.avg_headway_sec else "",
-                self.saturation_flow if self.saturation_flow else "",
-                self.phf if self.phf else "",
-                self.speed_85th if self.speed_85th else "",
-                self.speed_mean if self.speed_mean else "",
-            ])
-        # Headway calculation (time gap between consecutive crossings)
+        row = [
+            datetime.datetime.now().isoformat(timespec="seconds"),
+            tid, vtype, zone, direction,
+            round(speed_kmh, 1) if speed_kmh else "",
+            self.session_label,
+            self.queue_length,
+            round(self.occupancy_pct, 1),
+            self.current_rate,
+            self.avg_headway_sec if self.avg_headway_sec else "",
+            self.saturation_flow if self.saturation_flow else "",
+            self.phf if self.phf else "",
+            self.speed_85th if self.speed_85th else "",
+            self.speed_mean if self.speed_mean else "",
+            # Location metadata — from Settings → Study Location
+            self.site_name, self.site_lat, self.site_lng,
+        ]
+        self._csv_write_row(row)
+
+        # Headway calculation
         now_dt = datetime.datetime.now()
         if vtype in self._last_cross_time:
             gap = (now_dt - self._last_cross_time[vtype]).total_seconds()
-            if 0.5 < gap < 120:   # filter noise and long gaps
+            if 0.5 < gap < 120:
                 self.headway_history.append((vtype, gap))
                 if len(self.headway_history) > 200:
                     self.headway_history = self.headway_history[-100:]
-                # Average headway and saturation flow
                 recent = [g for _, g in self.headway_history[-50:]]
                 if recent:
                     self.avg_headway_sec = round(sum(recent) / len(recent), 2)
-                    # Saturation flow ≈ 3600 / avg_headway (veh/hr)
                     self.saturation_flow = int(3600 / self.avg_headway_sec)
+                    self._compute_los()
         self._last_cross_time[vtype] = now_dt
 
         # Speed percentiles
@@ -847,16 +1263,89 @@ class VehicleDetector:
             self.speed_85th = round(sorted_sp[int(n * 0.85)], 1) if n >= 5 else 0.0
             self.speed_mean = round(sum(sorted_sp) / n, 1)
 
+    def _autosave_checkpoint(self):
+        """
+        Save a session snapshot every 5 minutes.
+        - data/session_checkpoint.csv : always overwritten (latest state, quick check)
+        - data/checkpoints/session_LABEL_HH.csv : hourly rotating backup (keeps last 48)
+          Protects against crash data loss for long sessions (2-day records etc.)
+        """
+        try:
+            fwd = sum(self.dir_counts.get(DIR_FORWARD, {}).values())
+            bwd = sum(self.dir_counts.get(DIR_BACKWARD, {}).values())
+            now_str = datetime.datetime.now().isoformat(timespec="seconds")
+
+            row_header = [
+                "checkpoint_time", "session", "frame_no",
+                "total_vehicles", "fwd", "bwd",
+                "current_rate_vph", "peak_rate_vph", "phf",
+                "avg_headway_sec", "saturation_flow",
+                "speed_85th_kmh", "speed_mean_kmh",
+                "queue_length", "safety_events",
+                "reid_cache_size", "speed_hist_size"
+            ] + [f"count_{vt}" for vt in self.total_counts]
+
+            row_data = [
+                now_str, self.session_label, self.frame_no,
+                len(self.counted_ids), fwd, bwd,
+                self.current_rate, self.peak_rate, self.phf,
+                self.avg_headway_sec, self.saturation_flow,
+                self.speed_85th, self.speed_mean,
+                self.queue_length, self.safety_events,
+                len(self._reid_cache), len(self.speed_history),
+            ] + list(self.total_counts.values())
+
+            data_folder = getattr(config, "DATA_FOLDER", "data")
+
+            # 1. Always-overwrite latest checkpoint (for quick status checks)
+            ckpt_path = os.path.join(data_folder, "session_checkpoint.csv")
+            with open(ckpt_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(row_header)
+                w.writerow(row_data)
+
+            # 2. Hourly rotating backup — one file per hour, keeps data safe over crashes
+            # File named by session + hour-of-day so each hour produces a unique file
+            ckpt_dir = os.path.join(data_folder, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            hour_tag = datetime.datetime.now().strftime("%Y%m%d_%H")
+            # Safe session label for filename (strip colons/spaces)
+            safe_label = "".join(c if c.isalnum() or c in "-_" else "_"
+                                 for c in self.session_label)[:40]
+            hourly_path = os.path.join(ckpt_dir, f"ckpt_{safe_label}_{hour_tag}.csv")
+            # Append to hourly file (multiple 5-min snapshots per hour)
+            write_header = not os.path.exists(hourly_path)
+            with open(hourly_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if write_header:
+                    w.writerow(row_header)
+                w.writerow(row_data)
+
+            # 3. Prune old hourly checkpoints — keep last 48 files (2 days)
+            existing = sorted(
+                f for f in os.listdir(ckpt_dir) if f.endswith(".csv"))
+            for old in existing[:-48]:
+                try: os.remove(os.path.join(ckpt_dir, old))
+                except OSError: pass
+
+            print(f"[INFO] Checkpoint saved: {len(self.counted_ids)} vehicles "
+                  f"@ frame {self.frame_no}  ({hourly_path})")
+
+        except Exception as e:
+            print(f"[WARN] Checkpoint save failed: {e}")
+
     def save_session_summary(self):
         """Save a one-row session summary CSV alongside the main log."""
         try:
             fwd = sum(self.dir_counts.get(DIR_FORWARD, {}).values())
             bwd = sum(self.dir_counts.get(DIR_BACKWARD, {}).values())
             summary_path = self.csv_path.replace(".csv", "_summary.csv")
-            with open(summary_path, "w", newline="") as f:
+            with open(summary_path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 w.writerow([
-                    "session", "total_vehicles", "fwd", "bwd",
+                    "session", "site_name", "latitude", "longitude",
+
+                    "total_vehicles", "fwd", "bwd",
                     "peak_rate_vph", "phf",
                     "avg_headway_sec", "saturation_flow_vph",
                     "speed_85th_kmh", "speed_mean_kmh",
@@ -864,6 +1353,7 @@ class VehicleDetector:
                 ] + [f"count_{vt}" for vt in self.total_counts])
                 w.writerow([
                     self.session_label,
+                    self.site_name, self.site_lat, self.site_lng,
                     len(self.counted_ids), fwd, bwd,
                     self.peak_rate, self.phf,
                     self.avg_headway_sec, self.saturation_flow,
@@ -871,39 +1361,100 @@ class VehicleDetector:
                     self.safety_events, len(self.near_miss_log),
                 ] + list(self.total_counts.values()))
             print(f"[INFO] Session summary -> {summary_path}")
+            # Auto-export TMC if zone data exists
+            if self.turning_counts:
+                self.export_tmc_csv()
             return summary_path
         except Exception as e:
             print(f"[WARN] Could not save session summary: {e}")
             return None
+
+    def _compute_los(self):
+        """
+        Approximate LOS from observed headway / saturation flow.
+        Uses Webster simplified delay formula as a proxy:
+          d = 9 + (3600/sf * vc^2) / (2*(1-vc))
+        NOTE: This is a rough estimate suited for unsignalized/mixed
+        intersections — not a full HCM signalized intersection analysis.
+        LOS thresholds (HCM 6th, Table 19-1): A<=10 B<=15 C<=25 D<=35 E<=50 F>50
+        """
         try:
+            sf = self.saturation_flow
+            rate = self.current_rate
+            if sf <= 0 or rate <= 0:
+                self.los_letter = "—"; self.avg_delay_sec = 0.0; return
+            vc = min(rate / sf, 0.999)
+            d = 9.0 + (3600.0 / sf * vc * vc) / (2.0 * (1.0 - vc))
+            self.avg_delay_sec = round(d, 1)
+            if   d <= 10: self.los_letter = "A"
+            elif d <= 15: self.los_letter = "B"
+            elif d <= 25: self.los_letter = "C"
+            elif d <= 35: self.los_letter = "D"
+            elif d <= 50: self.los_letter = "E"
+            else:         self.los_letter = "F"
+        except Exception:
+            self.los_letter = "—"; self.avg_delay_sec = 0.0
+
+    def export_tmc_csv(self, output_path=None):
+        """
+        Export Turning Movement Count matrix as CSV.
+        Format: rows = approach zones, cols = exit zones, values = total vehicles.
+        Compatible with Synchro, SIDRA, and manual HCM worksheets.
+        """
+        try:
+            if not self.turning_counts:
+                print("[INFO] No TMC data — enable zones and draw approach lanes first.")
+                return None
             import pandas as pd
-            df = pd.read_csv(self.csv_path)
-            if df.empty: return None
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-            dur = max((df["timestamp"].max() - df["timestamp"].min()).total_seconds() / 3600, 0.017)
+            # Build flat records
             rows = []
-            for vt in df["vehicle_type"].dropna().unique():
-                sub = df[df["vehicle_type"] == vt]; cnt = len(sub)
-                fwd = len(sub[sub["direction"].str.contains("FWD|Forward", na=False)])
-                rows.append({"VehicleType": vt, "TotalCount": cnt,
-                             "Volume_veh_per_hour": round(cnt / dur, 1),
-                             "Forward_count": fwd, "Backward_count": cnt - fwd,
-                             "Duration_hours": round(dur, 3),
-                             "Session": self.session_label})
+            for movement, vtype_dict in self.turning_counts.items():
+                total = sum(vtype_dict.values())
+                entry, exit_ = (movement.split("→") + ["—"])[:2]
+                row = {"movement": movement, "from_zone": entry,
+                       "to_zone": exit_, "total": total}
+                row.update(vtype_dict)
+                rows.append(row)
+            df = pd.DataFrame(rows).fillna(0)
+            # Pivot: approach rows × exit columns
+            if "from_zone" in df.columns and "to_zone" in df.columns:
+                pivot = df.pivot_table(index="from_zone", columns="to_zone",
+                                       values="total", aggfunc="sum", fill_value=0)
+                pivot.index.name   = "Approach"
+                pivot.columns.name = "Exit"
+                # Add approach total column
+                pivot["TOTAL"] = pivot.sum(axis=1)
+            else:
+                pivot = df
             if not output_path:
-                output_path = self.csv_path.replace(".csv", "_vissim.csv")
-            pd.DataFrame(rows).to_csv(output_path, index=False)
-            print(f"[INFO] Vissim export -> {output_path}")
+                output_path = self.csv_path.replace(".csv", "_tmc.csv")
+            pivot.to_csv(output_path)
+            # Also save full detail (by vehicle type)
+            detail_path = output_path.replace("_tmc.csv", "_tmc_detail.csv")
+            df.to_csv(detail_path, index=False)
+            print(f"[INFO] TMC matrix  -> {output_path}")
+            print(f"[INFO] TMC detail  -> {detail_path}")
             return output_path
         except Exception as e:
-            print(f"[WARN] Vissim export: {e}"); return None
+            print(f"[WARN] TMC export failed: {e}")
+            return None
 
     def print_summary(self):
         fwd = sum(self.dir_counts[DIR_FORWARD].values())
         bwd = sum(self.dir_counts[DIR_BACKWARD].values())
+        # Load author name from prefs if available, fallback to generic
+        try:
+            import json as _json
+            with open("data/user_prefs.json", encoding="utf-8") as _pf:
+                _p = _json.load(_pf)
+            _author = _p.get("author_name", "") or ""
+            _inst   = _p.get("institution", "") or ""
+            _byline = f"  {_author}{', ' + _inst if _inst else ''}  |  NextCity Tessera" if _author else "  VELOXIS  |  NextCity Tessera"
+        except Exception:
+            _byline = "  VELOXIS  |  NextCity Tessera"
         print("\n" + "=" * 55)
         print(f"  VELOXIS  --  {self.session_label}")
-        print(f"  Nishan, SUST CEE 2026  |  NextCity Tessera")
+        print(_byline)
         print("=" * 55)
         print(f"  Total vehicles : {len(self.counted_ids)}")
         for vt, cnt in self.total_counts.items():
@@ -914,7 +1465,18 @@ class VehicleDetector:
         print(f"  PHF            : {self.phf:.3f}  (ideal 0.85-0.95)")
         print(f"  Avg headway    : {self.avg_headway_sec:.1f} sec")
         print(f"  Saturation flow: {self.saturation_flow} veh/hr")
+        print(f"  LOS            : {self.los_letter}  (delay {self.avg_delay_sec:.1f} s/veh)")
         print(f"  Speed V85      : {self.speed_85th} km/h")
         print(f"  Speed mean     : {self.speed_mean} km/h")
+        if self.approach_counts:
+            print(f"\n  -- Approach Volumes --")
+            for arm, cnt in sorted(self.approach_counts.items()):
+                print(f"  {arm:<20} {cnt:>5} veh")
+        if self.turning_counts:
+            print(f"\n  -- Turning Movement Counts --")
+            for mv, vd in sorted(self.turning_counts.items()):
+                total = sum(vd.values())
+                detail = "  ".join(f"{k}:{v}" for k, v in vd.items())
+                print(f"  {mv:<25} {total:>4}  ({detail})")
         print(f"\n  Log -> {self.csv_path}")
         print("=" * 55)

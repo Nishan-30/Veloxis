@@ -14,7 +14,7 @@ BANNER = r"""
  /_/   \____/ /_/|_|\____/___/\___//_/|_|   /_/ /_/
 
   Bangladesh Road Vehicle Counter — by Nishan (SUST CEE)
-  100%% free | YOLO v8 + DeepSORT | Flask dashboard
+  100%% free | YOLOv11 + Custom Tracker | Flask dashboard
 """
 
 

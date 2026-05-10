@@ -35,21 +35,503 @@ def save_prefs(d: dict):
     p = load_prefs(); p.update(d)
     with open(PREFS_FILE, "w", encoding="utf-8") as f: json.dump(p, f, indent=2)
 
-# ── Theme setup (CTk native — no hex needed) ──────────────────
+# ── Map Report Generator ───────────────────────────────────────
+def generate_map_report(session_label=None):
+    """
+    Generate a self-contained HTML map report.
+    Embeds OpenStreetMap via Leaflet.js (no API key needed).
+    Includes: study site pin, volume summary, key metrics table.
+    Saves to data/map_report_<timestamp>.html and opens in browser.
+    Returns the path or None on failure.
+    """
+    import webbrowser, glob as _glob
+    p = load_prefs()
+    try:
+        lat  = float(p.get("loc_lat") or 0)
+        lng  = float(p.get("loc_lng") or 0)
+    except (ValueError, TypeError):
+        lat = lng = 0.0
+
+    site_name = p.get("loc_name","Unknown Site") or "Study Intersection"
+    has_coords = (lat != 0 and lng != 0)
+
+    # Load session data
+    files = _glob.glob(os.path.join("data","log_*.csv"))
+    total = fwd = bwd = 0
+    bt    = {}
+    phf   = v85 = los = headway = satflow = "—"
+    duration_hrs = 0.0
+    t_start = t_end = "—"
+    speed_note = ""
+
+    try:
+        dfs = [d for d in [pd.read_csv(f) for f in files] if not d.empty]
+        if dfs:
+            df = pd.concat(dfs, ignore_index=True)
+            if session_label and "session" in df.columns:
+                df = df[df["session"]==session_label]
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                t_start = df["timestamp"].min().strftime("%Y-%m-%d %H:%M") \
+                    if pd.notna(df["timestamp"].min()) else "—"
+                t_end   = df["timestamp"].max().strftime("%Y-%m-%d %H:%M") \
+                    if pd.notna(df["timestamp"].max()) else "—"
+                dur_sec = (df["timestamp"].max()-df["timestamp"].min()).total_seconds()
+                duration_hrs = max(dur_sec/3600, 0.017)
+            total = len(df)
+            if "vehicle_type" in df.columns:
+                bt = df["vehicle_type"].value_counts().to_dict()
+            if "direction" in df.columns:
+                fwd = df["direction"].str.contains("FWD",na=False).sum()
+                bwd = total - fwd
+            # Pull metrics from summary CSV if available
+            sumfiles = _glob.glob(os.path.join("data","*_summary.csv"))
+            if sumfiles:
+                sdf = pd.read_csv(sorted(sumfiles)[-1])
+                if not sdf.empty:
+                    row = sdf.iloc[-1]
+                    phf      = f"{float(row.get('phf','0')):.2f}" if row.get('phf') else "—"
+                    v85      = f"{float(row.get('speed_85th_kmh','0')):.0f}" if row.get('speed_85th_kmh') else "—"
+                    los      = str(row.get('los_letter','—'))
+                    headway  = f"{float(row.get('avg_headway_sec','0')):.1f}" if row.get('avg_headway_sec') else "—"
+                    satflow  = str(int(float(row.get('saturation_flow_vph',0)))) if row.get('saturation_flow_vph') else "—"
+                    # Speed vs limit note
+                    try:
+                        lim_raw = p.get("speed_limit","50")
+                        lim_val = int(str(lim_raw).replace("*",""))
+                        v85_val = float(row.get('speed_85th_kmh',0))
+                        if v85_val and lim_val:
+                            diff = v85_val - lim_val
+                            if diff > 10:   speed_note = f"⚠️ V85 exceeds limit by {diff:.0f} km/h"
+                            elif diff > 0:  speed_note = f"↑ V85 slightly above posted limit"
+                            else:           speed_note = f"✓ V85 within posted speed limit"
+                    except: pass
+    except Exception: pass
+
+    # Build vehicle rows
+    vehicle_rows = ""
+    icons = {"car":"🚙","rickshaw":"🛺","cng":"🛺","motorcycle":"🏍",
+             "bus":"🚌","truck":"🚛","bicycle":"🚲","easybike":"⚡",
+             "battery_rickshaw":"🔋","human_hauler":"🚐","leguna":"🚐",
+             "nosimon":"🚜","microbus":"🚐","pickup":"🚚","tempo":"🚐"}
+    vol_rows = ""
+    for vt, cnt in sorted(bt.items(), key=lambda x: -x[1]):
+        icon = icons.get(vt.lower().replace("/","_").replace(" ","_"), "🚗")
+        vph  = f"{cnt/duration_hrs:.0f}" if duration_hrs>0 else "—"
+        vol_rows += f"<tr><td>{icon} {vt}</td><td>{cnt}</td><td>{vph}</td></tr>\n"
+
+    # Map section — only if coords available
+    map_section = ""
+    if has_coords:
+        map_section = f"""
+        <div id="map"></div>
+        <script>
+          var map = L.map('map').setView([{lat}, {lng}], 17);
+          L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
+            attribution:'© OpenStreetMap contributors', maxZoom:19}}).addTo(map);
+          var icon = L.divIcon({{
+            html:'<div style="font-size:28px;line-height:1">📍</div>',
+            className:'',iconAnchor:[14,28]}});
+          L.marker([{lat},{lng}],{{icon:icon}}).addTo(map)
+            .bindPopup('<b>{site_name}</b><br>Lat {lat:.5f}, Lng {lng:.5f}<br>Total: {total} vehicles')
+            .openPopup();
+        </script>"""
+    else:
+        map_section = """<div id="map" style="display:flex;align-items:center;
+            justify-content:center;color:#64748b;font-size:14px">
+            No GPS coordinates saved — set location in Settings to enable map</div>"""
+
+    los_colours = {"A":"#16a34a","B":"#65a30d","C":"#ca8a04",
+                   "D":"#ea580c","E":"#dc2626","F":"#7f1d1d","—":"#64748b"}
+    los_col = los_colours.get(los, "#64748b")
+
+    speed_note_html = f'<div class="speed-note">{speed_note}</div>' if speed_note else ""
+    road_type = p.get("road_type","—")
+    speed_limit = p.get("speed_limit","—")
+
+    # Build approach volume rows for map report
+    approach_rows = ""
+    try:
+        tmc_files = _glob.glob(os.path.join("data","*_tmc.csv"))
+        if tmc_files:
+            tdf = pd.read_csv(sorted(tmc_files)[-1], index_col=0)
+            tdf = tdf.drop(columns=["TOTAL"], errors="ignore")
+            if not tdf.empty:
+                for arm in tdf.index:
+                    arm_total = int(tdf.loc[arm].sum())
+                    exits = "  ".join(f"{col}:{int(tdf.loc[arm,col])}"
+                                      for col in tdf.columns if tdf.loc[arm,col]>0)
+                    approach_rows += f"<tr><td><b>{arm}</b></td><td>{arm_total}</td><td style='font-size:11px;color:#64748b'>{exits}</td></tr>\n"
+    except Exception:
+        pass
+
+    tmc_section = ""
+    if approach_rows:
+        tmc_section = f"""
+    <div class="panel" style="margin-bottom:20px">
+      <h2>Turning Movement Counts — Approach Summary</h2>
+      <table>
+        <thead><tr><th>Approach</th><th>Total</th><th>Exit breakdown</th></tr></thead>
+        <tbody>{approach_rows}</tbody>
+      </table>
+    </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VELOXIS — Traffic Map Report</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
+header{{background:linear-gradient(135deg,#1e3a5f,#0f172a);padding:20px 32px;
+  border-bottom:3px solid #3b82f6;display:flex;align-items:center;gap:18px}}
+header h1{{font-size:22px;font-weight:700;color:#60a5fa}}
+header .sub{{font-size:13px;color:#94a3b8;margin-top:3px}}
+.badge{{background:#3b82f6;color:#fff;font-size:11px;padding:3px 10px;
+  border-radius:20px;font-weight:600;margin-left:10px}}
+.container{{max-width:1100px;margin:0 auto;padding:24px 20px}}
+#map{{height:400px;border-radius:12px;margin-bottom:24px;border:1px solid #1e293b}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}}
+.card{{background:#1e293b;border-radius:10px;padding:14px 16px;border-top:3px solid}}
+.card .label{{font-size:10px;color:#64748b;letter-spacing:.05em;text-transform:uppercase;margin-bottom:6px}}
+.card .val{{font-size:24px;font-weight:700}}
+.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px}}
+@media(max-width:640px){{.grid2{{grid-template-columns:1fr}}}}
+.panel{{background:#1e293b;border-radius:12px;padding:20px;border:1px solid #1e3a5f}}
+.panel h2{{font-size:13px;font-weight:600;color:#94a3b8;margin-bottom:14px;
+  text-transform:uppercase;letter-spacing:.06em}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{text-align:left;color:#64748b;font-size:11px;padding:6px 8px;
+  border-bottom:1px solid #1e3a5f;text-transform:uppercase}}
+td{{padding:8px;border-bottom:1px solid #1e3a5f}}
+tr:last-child td{{border-bottom:none}}
+.los-badge{{display:inline-block;padding:3px 12px;border-radius:20px;
+  font-weight:700;font-size:18px;color:#fff;background:{los_col}}}
+.speed-note{{margin-top:10px;padding:8px 12px;background:#1e293b;
+  border-radius:8px;font-size:12px;color:#94a3b8;border-left:3px solid #3b82f6}}
+.meta{{background:#0f172a;border-radius:10px;padding:14px 18px;margin-bottom:20px;
+  border:1px solid #1e293b;font-size:12px;color:#64748b;line-height:2}}
+footer{{text-align:center;padding:24px;font-size:11px;color:#475569;border-top:1px solid #1e293b;margin-top:12px}}
+</style>
+</head>
+<body>
+<header>
+  <div style="font-size:32px">🚦</div>
+  <div>
+    <h1>VELOXIS — Traffic Analysis Report<span class="badge">NextCity Tessera</span></h1>
+    <div class="sub">{site_name} &nbsp;·&nbsp; {t_start} → {t_end} &nbsp;·&nbsp; {road_type}</div>
+  </div>
+</header>
+<div class="container">
+  <div class="meta">
+    📍 <b>Site:</b> {site_name} &nbsp;|&nbsp;
+    🗓 <b>Period:</b> {t_start} – {t_end} &nbsp;|&nbsp;
+    🛣 <b>Road type:</b> {road_type} &nbsp;|&nbsp;
+    🚦 <b>Speed limit:</b> {speed_limit} km/h &nbsp;|&nbsp;
+    📐 <b>Coords:</b> {lat:.5f}, {lng:.5f}
+  </div>
+
+  <div class="cards">
+    <div class="card" style="border-color:#3b82f6">
+      <div class="label">Total Vehicles</div>
+      <div class="val" style="color:#3b82f6">{total}</div>
+    </div>
+    <div class="card" style="border-color:#2dd4bf">
+      <div class="label">Forward</div>
+      <div class="val" style="color:#2dd4bf">{fwd}</div>
+    </div>
+    <div class="card" style="border-color:#fbbf24">
+      <div class="label">Backward</div>
+      <div class="val" style="color:#fbbf24">{bwd}</div>
+    </div>
+    <div class="card" style="border-color:{los_col}">
+      <div class="label">LOS</div>
+      <div class="val"><span class="los-badge">{los}</span></div>
+    </div>
+    <div class="card" style="border-color:#a78bfa">
+      <div class="label">PHF</div>
+      <div class="val" style="color:#a78bfa">{phf}</div>
+    </div>
+    <div class="card" style="border-color:#34d399">
+      <div class="label">V85 (km/h)</div>
+      <div class="val" style="color:#34d399">{v85}</div>
+    </div>
+    <div class="card" style="border-color:#fb923c">
+      <div class="label">Avg Headway</div>
+      <div class="val" style="color:#fb923c">{headway}s</div>
+    </div>
+    <div class="card" style="border-color:#60a5fa">
+      <div class="label">Sat. Flow</div>
+      <div class="val" style="color:#60a5fa">{satflow}</div>
+    </div>
+  </div>
+
+  {map_section}
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>Volume by Vehicle Type</h2>
+      <table>
+        <thead><tr><th>Type</th><th>Count</th><th>Veh/hr</th></tr></thead>
+        <tbody>{vol_rows}</tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Intersection Capacity Analysis</h2>
+      <table>
+        <tr><td>Level of Service</td><td><span class="los-badge">{los}</span></td></tr>
+        <tr><td>Peak Hour Factor (PHF)</td><td><b>{phf}</b></td></tr>
+        <tr><td>85th Percentile Speed</td><td><b>{v85} km/h</b></td></tr>
+        <tr><td>Posted Speed Limit</td><td>{speed_limit} km/h</td></tr>
+        <tr><td>Average Headway</td><td>{headway} sec/veh</td></tr>
+        <tr><td>Saturation Flow</td><td>{satflow} veh/hr</td></tr>
+        <tr><td>Total Volume</td><td>{total} vehicles</td></tr>
+        <tr><td>FWD / BWD Split</td><td>{fwd} / {bwd}</td></tr>
+      </table>
+      {speed_note_html}
+    </div>
+  </div>
+  {tmc_section}
+</div>
+<footer>
+  Generated by VELOXIS v2.0 · Nishan, SUST CEE · NextCity Tessera · {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
+</footer>
+</body>
+</html>"""
+
+    os.makedirs("data", exist_ok=True)
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join("data", f"map_report_{ts}.html")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        webbrowser.open(f"file:///{os.path.abspath(path)}")
+        return path
+    except Exception as e:
+        print(f"[WARN] Map report save failed: {e}")
+        return None
+
+
+def generate_map_report_multi(session_labels):
+    """
+    Generate one combined HTML report for multiple selected sessions.
+    Each session gets its own metrics row in a comparison table.
+    The map shows one pin (study site from prefs — same location assumed).
+    """
+    import webbrowser, glob as _glob
+    p = load_prefs()
+    try:
+        lat = float(p.get("loc_lat") or 0)
+        lng = float(p.get("loc_lng") or 0)
+    except (ValueError, TypeError):
+        lat = lng = 0.0
+    site_name  = p.get("loc_name","Study Intersection") or "Study Intersection"
+    has_coords = (lat != 0 and lng != 0)
+    road_type  = p.get("road_type","—")
+    speed_limit = p.get("speed_limit","—")
+
+    # Load all log CSVs then filter per session
+    files = _glob.glob(os.path.join("data","log_*.csv"))
+    try:
+        all_dfs = [d for d in [pd.read_csv(f) for f in files] if not d.empty]
+        full_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+        if "timestamp" in full_df.columns:
+            full_df["timestamp"] = pd.to_datetime(full_df["timestamp"], errors="coerce")
+    except Exception:
+        full_df = pd.DataFrame()
+
+    # Load summary CSVs
+    sumfiles = sorted(_glob.glob(os.path.join("data","*_summary.csv")))
+    try:
+        sum_df = pd.concat([pd.read_csv(f) for f in sumfiles], ignore_index=True) if sumfiles else pd.DataFrame()
+    except Exception:
+        sum_df = pd.DataFrame()
+
+    icons = {"car":"🚙","rickshaw":"🛺","cng":"🛺","motorcycle":"🏍",
+             "bus":"🚌","truck":"🚛","bicycle":"🚲","easybike":"⚡",
+             "battery_rickshaw":"🔋","human_hauler":"🚐","leguna":"🚐",
+             "nosimon":"🚜","microbus":"🚐","pickup":"🚚","tempo":"🚐"}
+
+    # Build per-session rows
+    session_rows_html = ""
+    grand_total = 0
+    type_totals = {}
+
+    for lbl in session_labels:
+        df_s = full_df[full_df["session"]==lbl] if "session" in full_df.columns else pd.DataFrame()
+        cnt  = len(df_s)
+        grand_total += cnt
+
+        t_start = t_end = "—"
+        if not df_s.empty and "timestamp" in df_s.columns:
+            t_start = df_s["timestamp"].min().strftime("%Y-%m-%d %H:%M") if pd.notna(df_s["timestamp"].min()) else "—"
+            t_end   = df_s["timestamp"].max().strftime("%Y-%m-%d %H:%M") if pd.notna(df_s["timestamp"].max()) else "—"
+
+        # Vehicle type breakdown for this session
+        bt = {}
+        if not df_s.empty and "vehicle_type" in df_s.columns:
+            bt = df_s["vehicle_type"].value_counts().to_dict()
+        for vt, c in bt.items():
+            type_totals[vt] = type_totals.get(vt,0) + c
+
+        # Direction
+        fwd = bwd = 0
+        if not df_s.empty and "direction" in df_s.columns:
+            fwd = df_s["direction"].str.contains("FWD",na=False).sum()
+            bwd = cnt - fwd
+
+        # Metrics from summary CSV
+        phf = v85 = los = hdwy = sat = "—"
+        if not sum_df.empty and "session" in sum_df.columns:
+            sr = sum_df[sum_df["session"]==lbl]
+            if not sr.empty:
+                row = sr.iloc[-1]
+                phf = f"{float(row.get('phf',0)):.2f}"          if row.get('phf') else "—"
+                v85 = f"{float(row.get('speed_85th_kmh',0)):.0f}" if row.get('speed_85th_kmh') else "—"
+                los = str(row.get('los_letter','—'))
+                hdwy= f"{float(row.get('avg_headway_sec',0)):.1f}" if row.get('avg_headway_sec') else "—"
+                sat = str(int(float(row.get('saturation_flow_vph',0)))) if row.get('saturation_flow_vph') else "—"
+
+        type_str = "  ".join(f"{icons.get(k.lower(),'🚗')}{k}:{v}" for k,v in list(bt.items())[:5])
+        los_cols = {"A":"#16a34a","B":"#65a30d","C":"#ca8a04","D":"#ea580c","E":"#dc2626","F":"#7f1d1d","—":"#64748b"}
+        los_col  = los_cols.get(los,"#64748b")
+
+        session_rows_html += f"""
+        <tr>
+          <td style="font-size:11px;color:#94a3b8;white-space:nowrap">{lbl[:28]}</td>
+          <td style="font-size:11px;color:#64748b">{t_start}</td>
+          <td><b>{cnt}</b></td>
+          <td>{fwd}</td><td>{bwd}</td>
+          <td><span style="background:{los_col};color:#fff;padding:2px 8px;border-radius:12px;font-weight:700">{los}</span></td>
+          <td>{phf}</td><td>{v85}</td><td>{hdwy}s</td><td>{sat}</td>
+        </tr>
+        <tr><td colspan="10" style="padding:2px 8px 8px;font-size:10px;color:#475569">{type_str}</td></tr>
+"""
+
+    # Grand total type breakdown
+    vol_rows = ""
+    dur_total = 0
+    for vt, cnt_t in sorted(type_totals.items(), key=lambda x: -x[1]):
+        icon = icons.get(vt.lower().replace("/","_").replace(" ","_"),"🚗")
+        vol_rows += f"<tr><td>{icon} {vt}</td><td>{cnt_t}</td><td>{round(cnt_t/max(dur_total,1),0) if dur_total else '—'}</td></tr>\n"
+
+    # Map
+    map_section = f"""
+    <div id="map"></div>
+    <script>
+      var map = L.map('map').setView([{lat},{lng}],17);
+      L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
+        attribution:'© OpenStreetMap contributors',maxZoom:19}}).addTo(map);
+      var icon=L.divIcon({{html:'<div style="font-size:28px;line-height:1">📍</div>',className:'',iconAnchor:[14,28]}});
+      L.marker([{lat},{lng}],{{icon:icon}}).addTo(map)
+        .bindPopup('<b>{site_name}</b><br>{len(session_labels)} sessions · {grand_total} vehicles total')
+        .openPopup();
+    </script>""" if has_coords else """<div id="map" style="display:flex;align-items:center;
+        justify-content:center;color:#64748b;font-size:14px">No GPS coordinates — set location in Settings</div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VELOXIS — Multi-Session Report</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
+header{{background:linear-gradient(135deg,#1e3a5f,#0f172a);padding:20px 32px;border-bottom:3px solid #3b82f6;display:flex;align-items:center;gap:18px}}
+header h1{{font-size:20px;font-weight:700;color:#60a5fa}}
+.badge{{background:#3b82f6;color:#fff;font-size:11px;padding:3px 10px;border-radius:20px;font-weight:600;margin-left:10px}}
+.container{{max-width:1200px;margin:0 auto;padding:24px 20px}}
+#map{{height:360px;border-radius:12px;margin-bottom:24px;border:1px solid #1e293b}}
+.summary-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:24px}}
+.card{{background:#1e293b;border-radius:10px;padding:12px 14px;border-top:3px solid}}
+.card .label{{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}}
+.card .val{{font-size:22px;font-weight:700}}
+.panel{{background:#1e293b;border-radius:12px;padding:20px;border:1px solid #1e3a5f;margin-bottom:20px}}
+.panel h2{{font-size:12px;font-weight:600;color:#94a3b8;margin-bottom:14px;text-transform:uppercase;letter-spacing:.06em}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+th{{text-align:left;color:#64748b;font-size:10px;padding:6px 8px;border-bottom:1px solid #1e3a5f;text-transform:uppercase;white-space:nowrap}}
+td{{padding:6px 8px;border-bottom:1px solid #0f172a;vertical-align:middle}}
+tr:hover td{{background:#0f172a20}}
+footer{{text-align:center;padding:20px;font-size:11px;color:#475569;border-top:1px solid #1e293b;margin-top:12px}}
+</style>
+</head>
+<body>
+<header>
+  <div style="font-size:30px">🚦</div>
+  <div>
+    <h1>VELOXIS — Multi-Session Report<span class="badge">{len(session_labels)} sessions</span></h1>
+    <div style="font-size:12px;color:#94a3b8;margin-top:3px">{site_name} &nbsp;·&nbsp; {road_type} &nbsp;·&nbsp; Speed limit: {speed_limit} km/h</div>
+  </div>
+</header>
+<div class="container">
+  <div class="summary-cards">
+    <div class="card" style="border-color:#3b82f6"><div class="label">Total Vehicles</div><div class="val" style="color:#3b82f6">{grand_total}</div></div>
+    <div class="card" style="border-color:#2dd4bf"><div class="label">Sessions</div><div class="val" style="color:#2dd4bf">{len(session_labels)}</div></div>
+    <div class="card" style="border-color:#a78bfa"><div class="label">Vehicle Types</div><div class="val" style="color:#a78bfa">{len(type_totals)}</div></div>
+  </div>
+
+  {map_section}
+
+  <div class="panel">
+    <h2>Session Comparison</h2>
+    <table>
+      <thead><tr>
+        <th>Session</th><th>Start</th><th>Total</th>
+        <th>FWD</th><th>BWD</th><th>LOS</th>
+        <th>PHF</th><th>V85</th><th>Headway</th><th>Sat.Flow</th>
+      </tr></thead>
+      <tbody>{session_rows_html}</tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Combined Volume by Vehicle Type</h2>
+    <table>
+      <thead><tr><th>Type</th><th>Count</th><th>Veh/hr</th></tr></thead>
+      <tbody>{vol_rows}</tbody>
+    </table>
+  </div>
+</div>
+<footer>Generated by VELOXIS v2.0 · NextCity Tessera · {__import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M")}</footer>
+</body></html>"""
+
+    os.makedirs("data", exist_ok=True)
+    ts   = __import__('datetime').datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join("data", f"map_report_multi_{ts}.html")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        webbrowser.open(f"file:///{os.path.abspath(path)}")
+        return path
+    except Exception as e:
+        print(f"[WARN] Multi map report save failed: {e}")
+        return None
+
+
+
 _prefs = load_prefs()
 _THEME = _prefs.get("theme", "dark")
 ctk.set_appearance_mode(_THEME)
 ctk.set_default_color_theme("blue")
 
-# Accent colours that don't need to change with theme
-# (used only for matplotlib and cv2 overlays)
-ACC_BLUE   = "#3b82f6"
-ACC_GREEN  = "#34d399"
-ACC_AMBER  = "#fbbf24"
-ACC_RED    = "#f87171"
-ACC_PURPLE = "#a78bfa"
-ACC_TEAL   = "#2dd4bf"
-LANE_COLS  = ["#2dd4bf","#fbbf24","#f87171","#a78bfa","#34d399","#fb923c"]
+# Accent colours — brighter, higher saturation for premium dark-mode feel
+ACC_BLUE   = "#4f8ef7"   # was #3b82f6 — brighter royal blue
+ACC_GREEN  = "#3ddba8"   # was #34d399 — vivid emerald
+ACC_AMBER  = "#fdc040"   # was #fbbf24 — warmer gold
+ACC_RED    = "#ff6b7a"   # was #f87171 — punchier coral-red
+ACC_PURPLE = "#b98df7"   # was #a78bfa — richer violet
+ACC_TEAL   = "#2fe6d4"   # was #2dd4bf — electric teal
+LANE_COLS  = ["#2fe6d4","#fdc040","#ff6b7a","#b98df7","#3ddba8","#fb923c"]
+
+# Chart palette — vivid series colours for matplotlib
+CHART_PALETTE = ["#4f8ef7","#2fe6d4","#fdc040","#ff6b7a","#b98df7",
+                 "#3ddba8","#fb923c","#f472b6","#38bdf8"]
 
 # Vehicle icon map
 V_ICONS = {
@@ -183,6 +665,22 @@ class DetectionThread(threading.Thread):
             self.on_status(f"ERROR: {e}"); return
         self.on_status("Loading YOLO model…")
         lbl=f"{'live' if self.mode=='live' else 'file'}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+        self._session_label = lbl   # stored so UI can pass to map report
+
+        # Check model file before creating detector — show warning in UI if fallback
+        import config as _cfg
+        _model = _cfg.YOLO_MODEL
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        _model_exists = os.path.exists(_model) or os.path.exists(os.path.join(_script_dir, _model))
+        _fallbacks = ["bd_vehicles_best.pt","yolo11s.pt","yolov8s.pt","yolov8n.pt"]
+        if not _model_exists:
+            _found = next((f for f in _fallbacks
+                           if os.path.exists(f) or os.path.exists(os.path.join(_script_dir,f))), None)
+            if _found:
+                self.on_status(f"⚠️  {_model} not found — using fallback: {_found}  (check Settings)")
+            else:
+                self.on_status(f"⚠️  No model file found — downloading yolo11s.pt (internet required)")
+
         det=VehicleDetector(session_label=lbl)
 
         # Apply manual line — takes priority over AI
@@ -192,7 +690,7 @@ class DetectionThread(threading.Thread):
 
         cap=(cv2.VideoCapture(self.source,cv2.CAP_DSHOW)
              if isinstance(self.source,int) else cv2.VideoCapture(self.source))
-        if not cap.isOpened(): self.on_status("Cannot open source."); return
+        if not cap.isOpened(): self.on_status("Cannot open source."); cap.release(); return
         cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
         total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
@@ -204,57 +702,90 @@ class DetectionThread(threading.Thread):
             self.on_status(f"Video FPS auto-detected: {detected_fps:.1f}")
 
         fn=0
-        while not self._stop.is_set():
-            ret,frame=cap.read()
-            if not ret:
-                if self.mode=="live": time.sleep(0.03); continue
-                break
-            fn+=1
-            if self.conf_ref:
-                import config as cfg; cfg.CONFIDENCE=self.conf_ref[0]
-
-            # AI calibration — only if no manual line
-            if self.ai and self.calibrating and det.manual_line_a is None:
-                done=self.ai.feed(frame)
-                if not done:
-                    pct=int(self.ai.progress()*100)
-                    self.on_status(f"AI analysing traffic flow… {pct}%")
-                    h,w=frame.shape[:2]
-                    ov=frame.copy()
-                    cv2.rectangle(ov,(0,0),(w,h),(10,14,22),cv2.FILLED)
-                    cv2.addWeighted(ov,0.65,frame,0.35,0,frame)
-                    bw=int(w*0.55); bx=(w-bw)//2; by=h//2
-                    cv2.rectangle(frame,(bx,by-10),(bx+bw,by+10),(30,35,50),-1)
-                    cv2.rectangle(frame,(bx,by-10),(bx+int(bw*pct/100),by+10),(45,180,140),-1)
-                    cv2.putText(frame,f"AI calibrating…  {pct}%",
-                                (bx,by-18),cv2.FONT_HERSHEY_SIMPLEX,0.62,(190,190,200),1)
-                    self._push(frame,{}); continue
-                else:
-                    self.calibrating=False
-                    # Only apply AI line if no manual line was set
-                    if self.ai.line_start and det.manual_line_a is None:
-                        det.ai_line_start=self.ai.line_start
-                        det.ai_line_end=self.ai.line_end
-                    self.on_status("Detecting…")
-            ann,summary=det.process_frame(frame)
-            cv2.putText(ann,f"FPS:{self.fps:.1f}",
-                        (ann.shape[1]-88,18),cv2.FONT_HERSHEY_SIMPLEX,0.48,(57,197,187),1)
-            self._push(ann,summary)
-            if self.on_progress and self.mode=="file":
-                self.on_progress(int(fn/total*100))
-        cap.release()
+        _t_last_frame = time.time()
+        _last_progress_pct = -1   # dedup guard — only fire on integer % change (max 101 calls)
+        try:
+            while not self._stop.is_set():
+                ret,frame=cap.read()
+                if not ret:
+                    if self.mode=="live": time.sleep(0.03); continue
+                    break
+                fn+=1
+                if self.conf_ref:
+                    import config as cfg; cfg.CONFIDENCE=self.conf_ref[0]
+    
+                # Live mode: if processing is slower than camera, drop frames to stay current
+                # This prevents counting line misses from accumulated lag
+                if self.mode=="live":
+                    _now = time.time()
+                    _elapsed = _now - _t_last_frame
+                    # If we're more than 2 frames behind (~67ms at 30fps), drain buffer
+                    if _elapsed < 0.02 and not self.frame_q.empty():
+                        continue  # skip this frame, read next
+                    _t_last_frame = _now
+    
+                # AI calibration — only if no manual line
+                if self.ai and self.calibrating and det.manual_line_a is None:
+                    done=self.ai.feed(frame)
+                    if not done:
+                        pct=int(self.ai.progress()*100)
+                        self.on_status(f"AI analysing traffic flow… {pct}%")
+                        h,w=frame.shape[:2]
+                        ov=frame.copy()
+                        cv2.rectangle(ov,(0,0),(w,h),(10,14,22),cv2.FILLED)
+                        cv2.addWeighted(ov,0.65,frame,0.35,0,frame)
+                        bw=int(w*0.55); bx=(w-bw)//2; by=h//2
+                        cv2.rectangle(frame,(bx,by-10),(bx+bw,by+10),(30,35,50),-1)
+                        cv2.rectangle(frame,(bx,by-10),(bx+int(bw*pct/100),by+10),(45,180,140),-1)
+                        cv2.putText(frame,f"AI calibrating…  {pct}%",
+                                    (bx,by-18),cv2.FONT_HERSHEY_SIMPLEX,0.62,(190,190,200),1)
+                        self._push(frame,{}); continue
+                    else:
+                        self.calibrating=False
+                        if self.ai.line_start and det.manual_line_a is None:
+                            det.ai_line_start=self.ai.line_start
+                            det.ai_line_end=self.ai.line_end
+                        self.on_status("Detecting…")
+                ann,summary=det.process_frame(frame)
+                cv2.putText(ann,f"FPS:{self.fps:.1f}",
+                            (ann.shape[1]-88,18),cv2.FONT_HERSHEY_SIMPLEX,0.48,(57,197,187),1)
+                self._push(ann,summary)
+                if self.on_progress and self.mode=="file":
+                    _pct = int(fn / total * 100)
+                    if _pct != _last_progress_pct:   # fire only on integer change
+                        _last_progress_pct = _pct
+                        self.on_progress(_pct)
+                    # Throttle to ~real-time playback based on video FPS
+                    # This prevents the analysis thread racing ahead of the display
+                    # while keeping live detection at full speed
+                    _target_spf = 1.0 / max(detected_fps, 10)  # seconds per frame
+                    time.sleep(max(0.005, _target_spf * 0.4))   # 40% of frame time = sustainable
+        except Exception as _loop_exc:
+            # Unhandled exception in detection loop — log it, fall through to cleanup
+            import traceback
+            print(f"[ERROR] Detection loop crashed: {_loop_exc}")
+            traceback.print_exc()
+            self.on_status(f"⚠️  Session interrupted — saving data…")
+        finally:
+            cap.release()
         # Save session summary CSV with all metrics
         det.save_session_summary()
         self.on_done({
-            "total_unique":  len(det.counted_ids),
-            "by_type":       det.total_counts,
-            "phf":           det.phf,
-            "peak_rate":     det.peak_rate,
-            "avg_headway":   det.avg_headway_sec,
-            "saturation":    det.saturation_flow,
-            "speed_85th":    det.speed_85th,
-            "speed_mean":    det.speed_mean,
-            "safety_events": det.safety_events,
+            "total_unique":   len(det.counted_ids),
+            "by_type":        det.total_counts,
+            "phf":            det.phf,
+            "peak_rate":      det.peak_rate,
+            "avg_headway":    det.avg_headway_sec,
+            "saturation":     det.saturation_flow,
+            "saturation_flow":det.saturation_flow,
+            "speed_85th":     det.speed_85th,
+            "speed_mean":     det.speed_mean,
+            "safety_events":  det.safety_events,
+            "los_letter":     det.los_letter,
+            "avg_delay_sec":  det.avg_delay_sec,
+            "turning_counts": det.turning_counts,
+            "approach_counts":det.approach_counts,
+            "session_label":  lbl,
         })
         self.on_status("Session complete ✓")
 
@@ -264,40 +795,26 @@ class DetectionThread(threading.Thread):
 # ================================================================
 
 class StatCard(ctk.CTkFrame):
-    """Premium stat card — accent bar at bottom, large number."""
+    """Premium stat card — thick accent bar, glowing value."""
     def __init__(self, master, label, value="—", accent=ACC_BLUE, icon="", **kw):
-        super().__init__(master, corner_radius=14, **kw)
+        super().__init__(master, corner_radius=14, border_width=1, **kw)
         self.grid_columnconfigure(0, weight=1)
-        top=ctk.CTkFrame(self, fg_color="transparent")
-        top.grid(row=0,column=0,padx=16,pady=(14,0),sticky="ew")
-        ctk.CTkLabel(top,text=icon,font=("Segoe UI",15)).pack(side="left",padx=(0,5))
-        ctk.CTkLabel(top,text=label.upper(),
-                     font=("Segoe UI",9,"bold")).pack(side="left")
-        self._val=ctk.CTkLabel(self,text=str(value),
-                               font=("Segoe UI",28,"bold"),text_color=accent)
-        self._val.grid(row=1,column=0,padx=16,pady=(2,10),sticky="w")
-        ctk.CTkFrame(self,fg_color=accent,height=3,corner_radius=0
-                    ).grid(row=2,column=0,sticky="ew")
-    def set(self,v): self._val.configure(text=str(v))
+        # Thick top accent bar
+        ctk.CTkFrame(self, fg_color=accent, height=4, corner_radius=0
+                    ).grid(row=0, column=0, sticky="ew")
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=1, column=0, padx=14, pady=(10, 0), sticky="ew")
+        ctk.CTkLabel(top, text=icon, font=("Segoe UI", 14)
+                    ).pack(side="left", padx=(0, 5))
+        ctk.CTkLabel(top, text=label.upper(),
+                     font=("Segoe UI", 8, "bold"),
+                     text_color="#64748b").pack(side="left")
+        self._val = ctk.CTkLabel(self, text=str(value),
+                                 font=("Segoe UI", 28, "bold"),
+                                 text_color=accent)
+        self._val.grid(row=2, column=0, padx=14, pady=(2, 14), sticky="w")
 
-
-class VideoCanvas(ctk.CTkLabel):
-    """Video display — shows frames. Subclass ClickableVideoCanvas for line setting."""
-    def __init__(self, master, placeholder="Press Start to begin", **kw):
-        super().__init__(master, text=placeholder, corner_radius=14,
-                         font=("Segoe UI",13), **kw)
-        self._img = None
-
-    def update_frame(self, frame: np.ndarray):
-        h, w = frame.shape[:2]
-        ww = max(self.winfo_width(), 640)
-        wh = max(self.winfo_height(), 360)
-        scale = min(ww/w, wh/h, 1.0)
-        nw, nh = int(w*scale), int(h*scale)
-        rgb = cv2.cvtColor(cv2.resize(frame,(nw,nh)), cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        self._img = ctk.CTkImage(light_image=img, dark_image=img, size=(nw,nh))
-        self.configure(image=self._img, text="")
+    def set(self, v): self._val.configure(text=str(v))
 
 
 class ClickableVideoCanvas(ctk.CTkLabel):
@@ -345,7 +862,7 @@ class ClickableVideoCanvas(ctk.CTkLabel):
             cv2.circle(disp, (nw-20, ly), 8, (57,197,187), -1)
             # Label
             cv2.rectangle(disp, (4, max(ly-22,0)), (260, max(ly-2,20)), (10,30,40), -1)
-            cv2.putText(disp, f"Counting line ({int(self._line_frac*100)}%) — drag to move",
+            cv2.putText(disp, f"Counting line ({int(self._line_frac*100)}%) - drag to move",
                         (8, max(ly-6, 14)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.44, (57,197,187), 1)
         else:
@@ -402,61 +919,90 @@ class ClickableVideoCanvas(ctk.CTkLabel):
 
 class NavBtn(ctk.CTkButton):
     def __init__(self, master, icon, label, cmd, **kw):
-        super().__init__(master,text=f"  {icon}   {label}",anchor="w",
-                         fg_color="transparent",font=("Segoe UI",13),
-                         height=44,corner_radius=10,command=cmd,**kw)
-    def set_active(self,v):
+        super().__init__(master, text=f"  {icon}   {label}", anchor="w",
+                         fg_color="transparent", font=("Segoe UI", 12),
+                         height=42, corner_radius=10, command=cmd, **kw)
+
+    def set_active(self, v):
         self.configure(
-            fg_color=(["#1e3a5f","#dbeafe"][ctk.get_appearance_mode()=="Light"] if v
+            fg_color=(["#1a3a6e", "#dbeafe"][ctk.get_appearance_mode() == "Light"] if v
                       else "transparent"),
-            font=("Segoe UI",13,"bold" if v else "normal"))
+            text_color=(ACC_BLUE if v else ("#94a3b8", "#475569")),
+            font=("Segoe UI", 12, "bold" if v else "normal"),
+            border_width=1 if v else 0,
+            border_color=ACC_BLUE)   # always a real colour — border_width=0 hides it anyway
 
 
 class SLabel(ctk.CTkLabel):
-    def __init__(self,master,text,**kw):
-        super().__init__(master,text=text.upper(),
-                         font=("Segoe UI",9,"bold"),**kw)
+    def __init__(self, master, text, **kw):
+        super().__init__(master, text=text.upper(),
+                         font=("Segoe UI", 9, "bold"),
+                         text_color=("#4f8ef7", "#64748b"), **kw)
 
 
 class StatusBar(ctk.CTkFrame):
-    def __init__(self,master,**kw):
-        super().__init__(master,height=28,corner_radius=0,**kw)
-        self.grid_columnconfigure(1,weight=1)
-        self._dot=ctk.CTkLabel(self,text="●",font=("Segoe UI",10),width=18)
-        self._dot.grid(row=0,column=0,padx=(10,4),sticky="w")
-        self._msg=ctk.CTkLabel(self,text="Ready",font=("Segoe UI",11))
-        self._msg.grid(row=0,column=1,sticky="w")
-        p=load_prefs()
-        name=p.get("author_name","Nishan")
-        inst=p.get("institution","SUST · CEE")
-        self._right=ctk.CTkLabel(self,
+    def __init__(self, master, **kw):
+        super().__init__(master, height=30, corner_radius=0, **kw)
+        self.grid_columnconfigure(1, weight=1)
+        # Left pill — status dot + message
+        pill = ctk.CTkFrame(self, fg_color="transparent")
+        pill.grid(row=0, column=0, padx=(10, 0), sticky="w")
+        self._dot = ctk.CTkLabel(pill, text="●", font=("Segoe UI", 10), width=18)
+        self._dot.pack(side="left")
+        self._msg = ctk.CTkLabel(pill, text="Ready", font=("Segoe UI", 11))
+        self._msg.pack(side="left", padx=(2, 0))
+        # Right — branding
+        p = load_prefs()
+        name = p.get("author_name", "Nishan")
+        inst = p.get("institution", "SUST · CEE")
+        self._right = ctk.CTkLabel(self,
             text=f"VELOXIS  ·  {name}, {inst}  ·  NextCity Tessera  ·  © 2026",
-            font=("Segoe UI",10))
-        self._right.grid(row=0,column=2,padx=12,sticky="e")
-    def set(self,msg,state="idle"):
-        colours={"idle":None,"running":ACC_GREEN,"warn":ACC_AMBER,"error":ACC_RED}
-        c=colours.get(state)
-        if c: self._dot.configure(text_color=c)
-        else: self._dot.configure(text_color=["#1f2937","#94a3b8"][ctk.get_appearance_mode()=="Light"])
+            font=("Segoe UI", 10), text_color="#4f8ef7")
+        self._right.grid(row=0, column=2, padx=12, sticky="e")
+
+    def set(self, msg, state="idle"):
+        colours = {"idle": None, "running": ACC_GREEN,
+                   "warn": ACC_AMBER, "error": ACC_RED}
+        c = colours.get(state)
+        if c:
+            self._dot.configure(text_color=c)
+        else:
+            self._dot.configure(
+                text_color=["#1f2937", "#94a3b8"][ctk.get_appearance_mode() == "Light"])
         self._msg.configure(text=msg)
 
 
 class Page(ctk.CTkFrame):
-    def __init__(self,master):
-        super().__init__(master,corner_radius=0)
-        self.grid_columnconfigure(0,weight=1)
-    def page_header(self,icon,title,subtitle):
-        hf=ctk.CTkFrame(self,fg_color="transparent")
-        hf.grid(row=0,column=0,padx=32,pady=(26,16),sticky="ew")
-        hf.grid_columnconfigure(1,weight=1)
-        ic=ctk.CTkFrame(hf,width=48,height=48,corner_radius=14)
-        ic.grid(row=0,column=0,rowspan=2,padx=(0,14)); ic.grid_propagate(False)
-        ctk.CTkLabel(ic,text=icon,font=("Segoe UI",22)
-                    ).place(relx=0.5,rely=0.5,anchor="center")
-        ctk.CTkLabel(hf,text=title,font=("Segoe UI",20,"bold")
-                    ).grid(row=0,column=1,sticky="w")
-        ctk.CTkLabel(hf,text=subtitle,font=("Segoe UI",12)
-                    ).grid(row=1,column=1,sticky="w")
+    def __init__(self, master):
+        super().__init__(master, corner_radius=0)
+        self.grid_columnconfigure(0, weight=1)
+
+    def page_header(self, icon, title, subtitle):
+        hf = ctk.CTkFrame(self, fg_color="transparent")
+        hf.grid(row=0, column=0, padx=0, pady=0, sticky="ew")
+        hf.grid_columnconfigure(1, weight=1)
+        # Gradient accent top bar (4px)
+        ctk.CTkFrame(hf, height=4, corner_radius=0,
+                     fg_color=(ACC_BLUE, "#2563eb")
+                    ).grid(row=0, column=0, columnspan=3, sticky="ew")
+        inner = ctk.CTkFrame(hf, fg_color="transparent")
+        inner.grid(row=1, column=0, columnspan=3, padx=32, pady=(16, 14), sticky="ew")
+        inner.grid_columnconfigure(1, weight=1)
+        # Icon badge — brighter, slightly larger
+        ic = ctk.CTkFrame(inner, width=50, height=50, corner_radius=14,
+                          fg_color=(ACC_BLUE, "#1a3a6e"))
+        ic.grid(row=0, column=0, rowspan=2, padx=(0, 18))
+        ic.grid_propagate(False)
+        ctk.CTkLabel(ic, text=icon, font=("Segoe UI", 22)
+                    ).place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(inner, text=title, font=("Segoe UI", 19, "bold")
+                    ).grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(inner, text=subtitle, font=("Segoe UI", 11),
+                     text_color="#64748b"
+                    ).grid(row=1, column=1, sticky="w")
+        # Bottom separator
+        ctk.CTkFrame(hf, height=1, corner_radius=0
+                    ).grid(row=2, column=0, columnspan=3, sticky="ew")
 
 
 class DetachedWindow(tk.Toplevel):
@@ -535,8 +1081,22 @@ class HomePage(Page):
         self.csess=StatCard(r2,"Sessions", "—","#94a3b8",  "📁")
         for i,c in enumerate([self.cbus,self.ctrk,self.cbike,self.csess]):
             c.grid(row=0,column=i,padx=(0 if i==0 else 10,0),sticky="ew")
-        SLabel(self,"Session Log").grid(row=3,column=0,padx=32,pady=(18,6),sticky="w")
-        self.log=ctk.CTkTextbox(self,font=("Consolas",12),corner_radius=12,
+        # Session log header row with buttons
+        log_hdr=ctk.CTkFrame(self,fg_color="transparent")
+        log_hdr.grid(row=3,column=0,padx=32,pady=(18,4),sticky="ew")
+        log_hdr.grid_columnconfigure(0,weight=1)
+        SLabel(log_hdr,"Session Log").grid(row=0,column=0,sticky="w")
+        ctk.CTkButton(log_hdr,text="🗺  Map Report",width=130,height=30,
+            fg_color=ACC_BLUE,hover_color="#2563eb",
+            font=("Segoe UI",11,"bold"),corner_radius=8,
+            command=self._map_report_dialog
+        ).grid(row=0,column=1,padx=(0,8))
+        ctk.CTkButton(log_hdr,text="🗑  Clear Log",width=100,height=30,
+            fg_color="transparent",border_width=1,
+            font=("Segoe UI",11),corner_radius=8,
+            command=self._clear_log
+        ).grid(row=0,column=2)
+        self.log=ctk.CTkTextbox(self,font=("Consolas",11),corner_radius=12,
                                  border_width=1)
         self.log.grid(row=4,column=0,padx=32,pady=(0,24),sticky="nsew")
         self._load_stats()
@@ -549,16 +1109,21 @@ class HomePage(Page):
 
     def _load_stats(self):
         df=self._get_df()
+        # Always clear first — prevents duplicate entries on refresh
+        self.log.delete("1.0","end")
         if df is None:
             self.log.insert("end","No sessions yet. Run detection to start.\n")
             return
         try:
             bt=df["vehicle_type"].value_counts().to_dict() if "vehicle_type" in df.columns else {}
-            self.ct.set(len(df)); self.cc.set(bt.get("car",0))
-            self.cr.set(bt.get("rickshaw",0) or bt.get("rickshaw/CNG",0))
-            self.cm.set(bt.get("motorcycle",0))
-            self.cbus.set(bt.get("bus",0)); self.ctrk.set(bt.get("truck",0))
-            self.cbike.set(bt.get("bicycle",0))
+            bt_low = {k.lower(): v for k, v in bt.items()}
+            self.ct.set(len(df))
+            self.cc.set(bt_low.get("car",0))
+            self.cr.set(bt_low.get("rickshaw",0) or bt_low.get("rickshaw/cng",0))
+            self.cm.set(bt_low.get("motorcycle",0))
+            self.cbus.set(bt_low.get("bus",0))
+            self.ctrk.set(bt_low.get("truck",0))
+            self.cbike.set(bt_low.get("bicycle",0) or bt_low.get("bike",0))
             nsess = df["session"].nunique() if "session" in df.columns else 0
             self.csess.set(nsess)
             # Load recent session history into log
@@ -577,15 +1142,92 @@ class HomePage(Page):
 
     def update_stats(self,s):
         bt=s.get("by_type",{})
-        self.ct.set(s.get("total_unique",0)); self.cc.set(bt.get("car",0))
-        self.cr.set(bt.get("rickshaw",0) or bt.get("rickshaw/CNG",0))
-        self.cm.set(bt.get("motorcycle",0))
-        self.cbus.set(bt.get("bus",0)); self.ctrk.set(bt.get("truck",0))
-        self.cbike.set(bt.get("bicycle",0))
+        bt_low = {k.lower(): v for k, v in bt.items()}
+        self.ct.set(s.get("total_unique",0))
+        self.cc.set(bt_low.get("car",0))
+        self.cr.set(bt_low.get("rickshaw",0) or bt_low.get("rickshaw/cng",0))
+        self.cm.set(bt_low.get("motorcycle",0))
+        self.cbus.set(bt_low.get("bus",0))
+        self.ctrk.set(bt_low.get("truck",0))
+        self.cbike.set(bt_low.get("bicycle",0) or bt_low.get("bike",0))
 
     def log_msg(self,msg):
         ts=datetime.datetime.now().strftime("%H:%M:%S")
         self.log.insert("end",f"[{ts}]  {msg}\n"); self.log.see("end")
+
+    def _clear_log(self):
+        self.log.delete("1.0","end")
+        self.log.insert("end","Log cleared.\n")
+
+    def _map_report_dialog(self):
+        """Session selector dialog for map report — single, multi, or all sessions."""
+        try:
+            files = glob.glob(os.path.join("data","log_*.csv"))
+            dfs = [d for d in [pd.read_csv(f) for f in files] if not d.empty]
+            if not dfs: generate_map_report(); return
+            df = pd.concat(dfs, ignore_index=True)
+            if "session" not in df.columns: generate_map_report(); return
+            sessions = sorted(df["session"].dropna().unique().tolist(), reverse=True)
+        except Exception: generate_map_report(); return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Map Report — Select Sessions")
+        dlg.geometry("480x520"); dlg.resizable(False, True)
+        dlg.configure(bg="#0f172a"); dlg.grab_set()
+
+        tk.Label(dlg,text="Map Report — Select Sessions",bg="#0f172a",fg="#60a5fa",
+                 font=("Segoe UI",14,"bold")).pack(padx=24,pady=(18,4),anchor="w")
+        tk.Label(dlg,text="Tick sessions to include. Multiple = combined report.",
+                 bg="#0f172a",fg="#94a3b8",font=("Segoe UI",11)).pack(padx=24,pady=(0,10),anchor="w")
+
+        frame=tk.Frame(dlg,bg="#1e293b"); frame.pack(fill="both",expand=True,padx=24,pady=(0,8))
+        canv=tk.Canvas(frame,bg="#1e293b",highlightthickness=0)
+        vsb=tk.Scrollbar(frame,orient="vertical",command=canv.yview)
+        canv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right",fill="y"); canv.pack(side="left",fill="both",expand=True)
+        inner=tk.Frame(canv,bg="#1e293b"); canv.create_window((0,0),window=inner,anchor="nw")
+        inner.bind("<Configure>",lambda e: canv.configure(scrollregion=canv.bbox("all")))
+
+        chk_vars={}
+        all_var=tk.BooleanVar(value=False)
+        def _toggle_all():
+            v=all_var.get()
+            for var in chk_vars.values(): var.set(v)
+        tk.Checkbutton(inner,text="  ALL sessions combined",variable=all_var,
+                       command=_toggle_all,bg="#1e293b",fg=ACC_BLUE,selectcolor="#0f172a",
+                       activebackground="#1e293b",activeforeground=ACC_BLUE,
+                       font=("Segoe UI",11,"bold"),cursor="hand2").pack(anchor="w",padx=12,pady=(10,6))
+        tk.Frame(inner,bg="#334155",height=1).pack(fill="x",padx=12,pady=(0,6))
+
+        for sess in sessions:
+            grp=df[df["session"]==sess]; cnt=len(grp)
+            if "timestamp" in grp.columns:
+                grp_ts=pd.to_datetime(grp["timestamp"],errors="coerce")
+                date_str=grp_ts.min().strftime("%Y-%m-%d %H:%M") if not grp_ts.isna().all() else "?"
+            else: date_str="?"
+            var=tk.BooleanVar(value=False); chk_vars[sess]=var
+            rf=tk.Frame(inner,bg="#1e293b"); rf.pack(fill="x",padx=12,pady=2)
+            tk.Checkbutton(rf,variable=var,bg="#1e293b",activebackground="#1e293b",
+                           selectcolor="#0f172a").pack(side="left")
+            tk.Label(rf,text=f"{sess[:32]}",bg="#1e293b",fg="#e2e8f0",
+                     font=("Segoe UI",10,"bold")).pack(side="left",padx=(2,6))
+            tk.Label(rf,text=f"{date_str}  ·  {cnt} veh",bg="#1e293b",fg="#64748b",
+                     font=("Segoe UI",9)).pack(side="left")
+
+        btn_f=tk.Frame(dlg,bg="#0f172a"); btn_f.pack(fill="x",padx=24,pady=(4,18))
+        def _generate():
+            selected=[s for s,v in chk_vars.items() if v.get()]
+            dlg.destroy()
+            if not selected: generate_map_report(None)
+            elif len(selected)==1: generate_map_report(selected[0])
+            else: generate_map_report_multi(selected)
+        tk.Button(btn_f,text="Generate Report",bg=ACC_BLUE,fg="white",
+                  font=("Segoe UI",12,"bold"),relief="flat",padx=20,pady=8,
+                  cursor="hand2",command=_generate).pack(side="left")
+        tk.Button(btn_f,text="Cancel",bg="#1e293b",fg="#94a3b8",
+                  font=("Segoe UI",11),relief="flat",padx=14,pady=8,
+                  cursor="hand2",command=dlg.destroy).pack(side="left",padx=(10,0))
+
 
 
 # ================================================================
@@ -670,7 +1312,8 @@ class LivePage(Page):
                       button_color=ACC_TEAL,progress_color=ACC_TEAL,
                       width=44,height=22).pack(side="left",padx=(0,8))
         ctk.CTkLabel(opt,text="AI auto-detect counting line",
-                     font=("Segoe UI",12,"bold"),text_color=ACC_TEAL).pack(side="left",padx=(0,24))
+                     font=("Segoe UI",12,"bold"),
+                     text_color=(ACC_TEAL,"#0f766e")).pack(side="left",padx=(0,24))
         ctk.CTkLabel(opt,text="Confidence:",font=("Segoe UI",12)).pack(side="left",padx=(0,6))
         self.conf_sl=ctk.CTkSlider(opt,from_=0.1,to=0.9,width=130,
             button_color=ACC_BLUE,progress_color=ACC_BLUE,
@@ -679,7 +1322,7 @@ class LivePage(Page):
                                self.conf_hint.configure(text=self._conf_hint(float(v)))])
         self.conf_sl.set(0.40); self.conf_sl.pack(side="left",padx=(0,4))
         self.conf_lbl=ctk.CTkLabel(opt,text="40%",font=("Segoe UI",11,"bold"),
-                                    width=36,text_color=ACC_BLUE)
+                                    width=36,text_color=(ACC_BLUE,"#1d4ed8"))
         self.conf_lbl.pack(side="left")
         self.conf_hint=ctk.CTkLabel(opt,text="· crowded road",
                                      font=("Segoe UI",9),text_color="#64748b")
@@ -704,49 +1347,71 @@ class LivePage(Page):
         self.snap_btn=ctk.CTkButton(br,text="📸  Snapshot",
             width=130,height=44,font=("Segoe UI",13),corner_radius=10,
             fg_color="transparent",border_width=1,command=self._snap)
-        self.snap_btn.pack(side="left",padx=(0,14))
+        self.snap_btn.pack(side="left",padx=(0,8))
+        self.map_rpt_btn=ctk.CTkButton(br,text="🗺  Map Report",
+            width=130,height=44,font=("Segoe UI",13),corner_radius=10,
+            fg_color=ACC_BLUE,hover_color="#2563eb",
+            command=lambda: generate_map_report(
+                getattr(self,"_current_session_label",None)))
+        self.map_rpt_btn.pack(side="left",padx=(0,14))
         self.timer_lbl=ctk.CTkLabel(br,text="00:00:00",font=("Consolas",13))
         self.timer_lbl.pack(side="left")
 
-        # ── Compact stats strip (one row, small) ─────────────
+        # ── Compact stats strip (one row) ────────────────────
         self.grid_rowconfigure(3,weight=0)
         self.grid_rowconfigure(4,weight=1)
 
-        strip=ctk.CTkFrame(self,fg_color="transparent",height=52)
-        strip.grid(row=3,column=0,padx=32,pady=(0,4),sticky="ew")
+        strip=ctk.CTkFrame(self,fg_color="transparent",height=72)
+        strip.grid(row=3,column=0,padx=32,pady=(0,6),sticky="ew")
         strip.grid_propagate(False)
-        strip.grid_columnconfigure(list(range(12)),weight=1)
 
         self.lv_cards={}
         items=[
-            ("total","Total","🚗",ACC_BLUE),
-            ("car","Cars","🚙",ACC_TEAL),
-            ("cng","CNG","🛺","#fb923c"),
-            ("rickshaw","Rick.","🛺",ACC_AMBER),
-            ("motorcycle","Moto","🏍",ACC_RED),
-            ("bus","Bus","🚌","#60a5fa"),
-            ("truck","Truck","🚛",ACC_PURPLE),
-            ("bicycle","Bike","🚲",ACC_GREEN),
-            ("_live","Live","📍","#60a5fa"),
-            ("_occ","Occ%","📊","#f97316"),
-            ("_queue","Queue","🚦","#818cf8"),
-            ("_rate","Rate/hr","📈","#fbbf24"),
-            ("_person","People","🚶","#a78bfa"),
-            ("_safety","Safety","⚠️","#f87171"),
+            ("total",    "Total",   "🚗", ACC_BLUE,   ("#1d4ed8","#3b82f6")),
+            ("car",      "Cars",    "🚙", ACC_TEAL,   ("#0f766e","#2dd4bf")),
+            ("cng",      "CNG",     "🛺", "#fb923c",  ("#c2410c","#fb923c")),
+            ("rickshaw", "Rick.",   "🛺", ACC_AMBER,  ("#b45309","#fbbf24")),
+            ("motorcycle","Moto",   "🏍", ACC_RED,    ("#b91c1c","#f87171")),
+            ("bus",      "Bus",     "🚌", "#60a5fa",  ("#1d4ed8","#60a5fa")),
+            ("truck",    "Truck",   "🚛", ACC_PURPLE, ("#6d28d9","#a78bfa")),
+            ("bicycle",  "Bike",   "🚲", ACC_GREEN,  ("#047857","#34d399")),
+            ("_live",    "Live",   "📍", "#60a5fa",  ("#1d4ed8","#60a5fa")),
+            ("_occ",     "Occ%",   "📊", "#f97316",  ("#c2410c","#f97316")),
+            ("_queue",   "Queue",  "🚦", "#818cf8",  ("#4c1d95","#818cf8")),
+            ("_rate",    "Rate/hr","📈", "#fbbf24",  ("#b45309","#fbbf24")),
+            ("_v85",     "V85",    "🚀", "#34d399",  ("#047857","#34d399")),
+            ("_limit",   "Limit",  "🛑", "#f87171",  ("#b91c1c","#f87171")),
+            ("_los",     "LOS",    "🏁", "#a78bfa",  ("#6d28d9","#a78bfa")),
+            ("_person",  "People", "🚶", "#a78bfa",  ("#6d28d9","#a78bfa")),
+            ("_safety",  "Safety", "⚠️", "#f87171",  ("#b91c1c","#f87171")),
         ]
-        for col,(key,lbl,icon,acc) in enumerate(items):
-            f=ctk.CTkFrame(strip,corner_radius=8,border_width=1,height=48)
-            f.grid(row=0,column=col,padx=(0 if col==0 else 2,0),sticky="ew")
-            f.grid_propagate(False); f.grid_columnconfigure(0,weight=1)
-            ctk.CTkLabel(f,text=f"{icon} {lbl}",font=("Segoe UI",8),
-                         text_color="#64748b").grid(row=0,column=0,pady=(4,0))
-            val_lbl=ctk.CTkLabel(f,text="0",font=("Segoe UI",13,"bold"),
-                                  text_color=acc)
-            val_lbl.grid(row=1,column=0,pady=(0,4))
-            ctk.CTkFrame(f,fg_color=acc,height=2,corner_radius=0
-                        ).grid(row=2,column=0,sticky="ew")
+        n_cols = len(items)
+        strip.grid_columnconfigure(list(range(n_cols)), weight=1)
+        strip.grid_rowconfigure(0, weight=1)
+
+        for col,(key,lbl,icon,acc,theme_color) in enumerate(items):
+            f=ctk.CTkFrame(strip,corner_radius=8,border_width=1)
+            f.grid(row=0,column=col,padx=(0 if col==0 else 2,0),sticky="nsew")
+            f.grid_propagate(False)
+            f.grid_rowconfigure(1,weight=1)
+            f.grid_rowconfigure(2,weight=1)
+            f.grid_columnconfigure(0,weight=1)
+            # Top accent bar
+            ctk.CTkFrame(f,fg_color=acc,height=3,corner_radius=0
+                        ).grid(row=0,column=0,sticky="ew")
+            # Label — small, always readable in both themes
+            ctk.CTkLabel(f,
+                         text=f"{icon} {lbl}",
+                         font=("Segoe UI",7),
+                         text_color=("#475569","#94a3b8"),
+                        ).grid(row=1,column=0,padx=2,pady=(3,0),sticky="sew")
+            # Value — theme-aware accent (dark=bright, light=dark shade)
+            val_lbl=ctk.CTkLabel(f,
+                                  text="0",
+                                  font=("Segoe UI",11,"bold"),
+                                  text_color=theme_color)
+            val_lbl.grid(row=2,column=0,padx=2,pady=(0,4),sticky="new")
             self.lv_cards[key]=val_lbl
-        strip.grid_columnconfigure(list(range(14)),weight=1)
 
         self._live_manual_line = None
         self.video=ClickableVideoCanvas(self,
@@ -810,6 +1475,7 @@ class LivePage(Page):
         if not src and src!=0: return
         save_prefs({"last_source":self.src_var.get()})
         self._t0=time.time(); self._conf_ref[0]=self.conf_sl.get()
+        self._current_session_label = None   # will be set when thread fires on_done
         if self.status_bar: self.status_bar.set("Detection running…","running")
         # Use manual line if user clicked on video
         manual = getattr(self,'_live_manual_line',None)
@@ -822,31 +1488,58 @@ class LivePage(Page):
         self.thread.start()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        # Fetch road speed limit in background (non-blocking)
+        self._road_speed_limit = "—"
+        threading.Thread(target=self._fetch_speed_limit, daemon=True).start()
         self._poll(); self._tick()
 
     def _poll(self):
-        if self.thread and self.thread.is_alive():
-            try:
-                frame,summary=self.thread.frame_q.get_nowait()
-                self._last_frame=frame; self.video.update_frame(frame)
-                if self._detached and not self._detached.closed:
-                    self._detached.update_frame(frame,summary)
-                    self._detached.set_fps(self.thread.fps)
-                if summary:
-                    bt=summary.get("by_type",{})
-                    total=summary.get("total_unique",0)
-                    self.lv_cards["total"].configure(text=str(total))
-                    for k in ["car","cng","rickshaw","motorcycle","bus","truck","bicycle"]:
-                        self.lv_cards[k].configure(text=str(bt.get(k,0)))
-                    self.lv_cards["_live"].configure(text=str(summary.get("live_vehicles",0)))
-                    self.lv_cards["_occ"].configure(text=f"{summary.get('occupancy_pct',0):.0f}%")
-                    self.lv_cards["_queue"].configure(text=str(summary.get("queue_length",0)))
-                    self.lv_cards["_rate"].configure(text=str(summary.get("current_rate",0)))
-                    self.lv_cards["_person"].configure(text=str(summary.get("person_count",0)))
-                    self.lv_cards["_safety"].configure(text=str(summary.get("safety_events",0)))
-                    if total and self.home_page:
-                        self.home_page.update_stats(summary)
-            except queue.Empty: pass
+        # Process frames from queue
+        try:
+            frame,summary=self.thread.frame_q.get_nowait()
+            self._last_frame=frame; self.video.update_frame(frame)
+            if self._detached and not self._detached.closed:
+                self._detached.update_frame(frame,summary)
+                self._detached.set_fps(self.thread.fps)
+            if summary:
+                bt=summary.get("by_type",{})
+                # Normalise keys to lowercase for robust matching
+                # Model may output "Car", "CNG", "Rickshaw" etc with different casing
+                bt_low = {k.lower(): v for k, v in bt.items()}
+                total=summary.get("total_unique",0)
+                self.lv_cards["total"].configure(text=str(total))
+                # Aliases: card_key -> list of possible model class names (all lowercase)
+                _card_aliases = {
+                    "car":        ["car"],
+                    "cng":        ["cng", "cng/auto", "auto", "auto_rickshaw", "autorickshaw"],
+                    "rickshaw":   ["rickshaw", "rickshaw/cng", "rick"],
+                    "motorcycle": ["motorcycle", "moto", "bike"],
+                    "bus":        ["bus"],
+                    "truck":      ["truck"],
+                    "bicycle":    ["bicycle", "bike", "cycle"],
+                }
+                for k, aliases in _card_aliases.items():
+                    val = sum(bt_low.get(a, 0) for a in aliases)
+                    self.lv_cards[k].configure(text=str(val))
+                self.lv_cards["_live"].configure(text=str(summary.get("live_vehicles",0)))
+                self.lv_cards["_occ"].configure(text=f"{summary.get('occupancy_pct',0):.0f}%")
+                self.lv_cards["_queue"].configure(text=str(summary.get("queue_length",0)))
+                self.lv_cards["_rate"].configure(text=str(summary.get("current_rate",0)))
+                v85 = summary.get("speed_85th", 0)
+                self.lv_cards["_v85"].configure(
+                    text=f"{v85:.0f}" if v85 else "—")
+                # Speed limit from cached Overpass fetch
+                lim = getattr(self, "_road_speed_limit", "—")
+                self.lv_cards["_limit"].configure(text=str(lim))
+                los = summary.get("los_letter", "—")
+                self.lv_cards["_los"].configure(text=str(los))
+                self.lv_cards["_person"].configure(text=str(summary.get("person_count",0)))
+                self.lv_cards["_safety"].configure(text=str(summary.get("safety_events",0)))
+                if total and self.home_page:
+                    self.home_page.update_stats(summary)
+        except queue.Empty: pass
+        # Keep polling as long as thread is alive OR queue still has frames
+        if self.thread and (self.thread.is_alive() or not self.thread.frame_q.empty()):
             self.after(33,self._poll)
 
     def _tick(self):
@@ -862,16 +1555,53 @@ class LivePage(Page):
     def _done(self,s):
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        if self.status_bar: self.status_bar.set("Session complete ✓","idle")
+        total = s.get("total_unique", 0)
+        phf   = s.get("phf", 0)
+        peak  = s.get("peak_rate", 0)
+        v85   = s.get("speed_85th", 0)
+        sat   = s.get("saturation", 0)
+        los   = s.get("los_letter", "—")
+        delay = s.get("avg_delay_sec", 0)
+        # Store session label so map report button filters to this session only
+        self._current_session_label = s.get("session_label")
+
+        # Speed comparison summary
+        lim_raw = getattr(self, "_road_speed_limit", "—")
+        speed_note = ""
+        try:
+            lim_val = int(str(lim_raw).replace("*",""))
+            if v85 and lim_val:
+                diff = v85 - lim_val
+                if diff > 10:
+                    speed_note = f"  ⚠ V85 exceeds limit by {diff:.0f}km/h"
+                elif diff > 0:
+                    speed_note = f"  ↑ V85 slightly above limit"
+                else:
+                    speed_note = f"  ✓ V85 within speed limit"
+        except: pass
+
+        if self.status_bar:
+            self.status_bar.set(
+                f"Session complete ✓  —  {total} vehicles  |  "
+                f"PHF:{phf:.2f}  Peak:{peak}v/hr  LOS:{los}({delay:.0f}s)  "
+                f"V85:{v85}km/h / Limit:{lim_raw}km/h{speed_note}",
+                "idle")
         if self.home_page:
             self.home_page.update_stats(s)
-            self.home_page.log_msg(f"Live session — {s.get('total_unique',0)} vehicles")
+            msg = (f"Live session — {total} vehicles  |  "
+                   f"PHF:{phf:.2f}  Peak:{peak}v/hr  LOS:{los}  "
+                   f"V85:{v85}km/h  Limit:{lim_raw}km/h{speed_note}  "
+                   f"SatFlow:{sat}v/hr")
+            self.home_page.log_msg(msg)
 
     def _stop(self):
-        if self.thread: self.thread.stop()
+        if self.thread:
+            self.thread.stop()
+            # _done callback fires from thread.run() after cap.release()
+            # Just update UI state here — don't reset counters
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        if self.status_bar: self.status_bar.set("Stopped","idle")
+        if self.status_bar: self.status_bar.set("Stopping — saving session…","warn")
 
     def _detach(self):
         if self._detached and not self._detached.closed:
@@ -888,6 +1618,93 @@ class LivePage(Page):
         if v < 0.55: return "daylight clear"
         if v < 0.70: return "strict"
         return "very strict"
+
+    def _fetch_speed_limit(self):
+        """
+        Fetch road speed limit from OpenStreetMap Overpass API.
+        Uses study location from Settings. Runs in background thread.
+        No API key needed — completely free.
+        """
+        try:
+            p = load_prefs()
+            lat = float(p.get("loc_lat") or 0)
+            lng = float(p.get("loc_lng") or 0)
+            if lat == 0 or lng == 0:
+                self.after(0, lambda: self.lv_cards["_limit"].configure(text="Set loc"))
+                return
+
+            # Overpass API query — finds roads within 50m of study point
+            # Gets maxspeed tag from nearest highway
+            import urllib.request, json as _json
+            delta = 0.0005   # ~50m radius
+            query = (
+                f"[out:json][timeout:8];"
+                f"way[highway][maxspeed]"
+                f"({lat-delta},{lng-delta},{lat+delta},{lng+delta});"
+                f"out tags 1;"
+            )
+            url = "https://overpass-api.de/api/interpreter"
+            req = urllib.request.Request(
+                url,
+                data=query.encode(),
+                headers={"Content-Type": "text/plain",
+                         "User-Agent": "VELOXIS/2.0 traffic-research"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = _json.loads(r.read())
+
+            elements = data.get("elements", [])
+            if elements:
+                raw = elements[0].get("tags", {}).get("maxspeed", "")
+                # Parse: "50", "50 mph", "50 km/h" → integer km/h
+                num = "".join(c for c in raw if c.isdigit())
+                if num:
+                    limit = int(num)
+                    # Convert mph → km/h if needed
+                    if "mph" in raw.lower():
+                        limit = round(limit * 1.609)
+                    self.after(0, lambda lim=limit: [
+                        setattr(self, "_road_speed_limit", f"{lim}"),
+                        self.lv_cards["_limit"].configure(text=f"{lim}"),
+                        self.status_bar and self.status_bar.set(
+                            f"Road speed limit: {lim} km/h (OSM)", "idle")
+                    ])
+                    return
+
+            # No maxspeed tag found — try wider radius (150m)
+            delta2 = 0.0015
+            query2 = (
+                f"[out:json][timeout:8];"
+                f"way[highway]"
+                f"({lat-delta2},{lng-delta2},{lat+delta2},{lng+delta2});"
+                f"out tags 3;"
+            )
+            req2 = urllib.request.Request(
+                url, data=query2.encode(),
+                headers={"Content-Type": "text/plain",
+                         "User-Agent": "VELOXIS/2.0 traffic-research"})
+            with urllib.request.urlopen(req2, timeout=10) as r2:
+                data2 = _json.loads(r2.read())
+
+            for el in data2.get("elements", []):
+                raw = el.get("tags", {}).get("maxspeed", "")
+                num = "".join(c for c in raw if c.isdigit())
+                if num:
+                    limit = int(num)
+                    if "mph" in raw.lower(): limit = round(limit * 1.609)
+                    self.after(0, lambda lim=limit: [
+                        setattr(self, "_road_speed_limit", f"{lim}"),
+                        self.lv_cards["_limit"].configure(text=f"{lim}")])
+                    return
+
+            # No speed limit in OSM — show default fallback
+            self.after(0, lambda: [
+                setattr(self, "_road_speed_limit", "50*"),
+                self.lv_cards["_limit"].configure(text="50*")])
+
+        except Exception as e:
+            self.after(0, lambda: [
+                setattr(self, "_road_speed_limit", "—"),
+                self.lv_cards["_limit"].configure(text="—")])
 
     def _live_line_set(self, frac):
         self._live_manual_line = frac
@@ -913,6 +1730,7 @@ class FilePage(Page):
         super().__init__(master); self.thread=None; self._last_frame=None
         self.status_bar=status_bar; self.home_page=home_page
         self._cap_preview=None; self._total_frames=1
+        self._road_speed_limit = "—"   # init here — avoids getattr(None) race in _done
         self.grid_rowconfigure(4,weight=1)
         self.page_header("🎬","File Detection","Analyse a recorded road video")
 
@@ -950,7 +1768,8 @@ class FilePage(Page):
                       button_color=ACC_TEAL,progress_color=ACC_TEAL,
                       width=44,height=22).pack(side="left",padx=(0,8))
         ctk.CTkLabel(ai_r,text="AI auto-detect line",
-                     font=("Segoe UI",12,"bold"),text_color=ACC_TEAL).pack(side="left",padx=(0,12))
+                     font=("Segoe UI",12,"bold"),
+                     text_color=(ACC_TEAL,"#0f766e")).pack(side="left",padx=(0,12))
         ctk.CTkLabel(ai_r,
                      text="← OFF: Click on the video frame below to draw your counting line  |  Right-click to clear",
                      font=("Segoe UI",11),text_color="#64748b").pack(side="left")
@@ -973,7 +1792,16 @@ class FilePage(Page):
             command=self._export).pack(side="left",padx=(0,6))
         ctk.CTkButton(br,text="🏙  Vissim Export",width=140,height=44,
             fg_color="transparent",border_width=1,font=("Segoe UI",13),
-            text_color=ACC_TEAL,command=self._export_vissim).pack(side="left",padx=(0,10))
+            text_color=(ACC_TEAL,"#0f766e"),command=self._export_vissim).pack(side="left",padx=(0,6))
+        self.map_btn=ctk.CTkButton(br,text="🗺  Map Report",width=130,height=44,
+            fg_color=ACC_BLUE,hover_color="#2563eb",font=("Segoe UI",13,"bold"),
+            state="disabled",command=self._map_report)
+        self.map_btn.pack(side="left",padx=(0,6))
+        self.tmc_btn=ctk.CTkButton(br,text="📋  TMC Export",width=130,height=44,
+            fg_color="transparent",border_width=1,
+            text_color=(ACC_PURPLE,"#6d28d9"),
+            font=("Segoe UI",13),state="disabled",command=self._export_tmc)
+        self.tmc_btn.pack(side="left",padx=(0,10))
         self.prog_lbl=ctk.CTkLabel(br,text="",font=("Segoe UI",12))
         self.prog_lbl.pack(side="left")
 
@@ -1071,12 +1899,22 @@ class FilePage(Page):
         self._poll()
 
     def _poll(self):
-        if self.thread and self.thread.is_alive():
-            try:
-                frame,_=self.thread.frame_q.get_nowait()
-                self._last_frame=frame; self.video.update_frame(frame)
-            except queue.Empty: pass
-            self.after(33,self._poll)
+        try:
+            frame, summary = self.thread.frame_q.get_nowait()
+            self._last_frame = frame
+            self.video.update_frame(frame)
+            # Update right-panel cards live during analysis
+            if summary:
+                bt = summary.get("by_type", {})
+                self.rcards["total"].set(summary.get("total_unique", 0))
+                for k in ["car","rickshaw","CNG/auto","motorcycle","bus","truck","bicycle"]:
+                    v = bt.get(k, 0)
+                    if v: self.rcards[k].set(v)
+        except queue.Empty:
+            pass
+        # Keep polling while thread alive OR queue still has frames to drain
+        if self.thread and (self.thread.is_alive() or not self.thread.frame_q.empty()):
+            self.after(33, self._poll)
 
     def _stop(self):
         if self.thread: self.thread.stop()
@@ -1085,14 +1923,125 @@ class FilePage(Page):
     def _done(self,s):
         self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
         self.prog.set(1)
+        self.map_btn.configure(state="normal")
+        self.tmc_btn.configure(state="normal" if s.get("turning_counts") else "disabled")
         bt=s.get("by_type",{})
+        bt_low = {k.lower(): v for k, v in bt.items()}
         self.rcards["total"].set(s.get("total_unique",0))
-        for k in ["car","rickshaw","CNG/auto","motorcycle","bus","truck","bicycle"]:
-            self.rcards[k].set(bt.get(k,0))
-        if self.status_bar: self.status_bar.set("Analysis complete ✓","idle")
+        _rcard_aliases = {
+            "car":       ["car"],
+            "rickshaw":  ["rickshaw","rickshaw/cng","rick"],
+            "CNG/auto":  ["cng","cng/auto","auto","auto_rickshaw"],
+            "motorcycle":["motorcycle","moto","bike"],
+            "bus":       ["bus"],
+            "truck":     ["truck"],
+            "bicycle":   ["bicycle","bike","cycle"],
+        }
+        for k, aliases in _rcard_aliases.items():
+            val = sum(bt_low.get(a, 0) for a in aliases)
+            if k in self.rcards: self.rcards[k].set(val)
+        # Store session label for map report
+        self._current_session_label = s.get("session_label")
+        self._last_session = s
+        v85  = s.get("speed_85th", 0)
+        phf  = s.get("phf", 0)
+        los  = s.get("los_letter", "—")
+        hdwy = s.get("avg_headway_sec", 0)
+        sat  = s.get("saturation_flow", 0)
+        # Always fetch fresh speed limit in bg — _road_speed_limit initialised to "—" in __init__
+        threading.Thread(target=self._fetch_and_compare, args=(v85,), daemon=True).start()
         if self.home_page:
             self.home_page.update_stats(s)
-            self.home_page.log_msg(f"File analysis — {s.get('total_unique',0)} vehicles")
+            self.home_page.log_msg(
+                f"File — {s.get('total_unique',0)} veh  "
+                f"PHF:{phf:.2f}  LOS:{los}  V85:{v85}km/h  "
+                f"Hdwy:{hdwy:.1f}s  SatFlow:{sat}v/hr")
+
+    def _map_report(self):
+        path = generate_map_report(getattr(self,"_current_session_label",None))
+        if path and self.status_bar:
+            self.status_bar.set(f"Map report saved: {path}","idle")
+
+    def _export_tmc(self):
+        from tkinter import filedialog, messagebox
+        path=filedialog.asksaveasfilename(defaultextension=".csv",
+            filetypes=[("CSV","*.csv")],initialfile="tmc_matrix.csv")
+        if not path: return
+        try:
+            files=glob.glob(os.path.join("data","*_tmc.csv"))
+            if not files:
+                messagebox.showinfo("No TMC data",
+                    "No TMC file found.\nEnable Zones in Lane Drawing and run detection.")
+                return
+            import shutil
+            shutil.copy(sorted(files)[-1], path)
+            # Also copy detail file if present
+            detail=sorted(files)[-1].replace("_tmc.csv","_tmc_detail.csv")
+            if os.path.exists(detail):
+                shutil.copy(detail, path.replace(".csv","_detail.csv"))
+            messagebox.showinfo("TMC Exported ✓",
+                f"TMC matrix saved to:\n{path}\n\n"
+                "Import into Synchro:\n"
+                "  Volume → Import → CSV\n\n"
+                "Use for HCM signal timing worksheets.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _fetch_and_compare(self, v85):
+        """Background fetch of speed limit then show comparison (FilePage). Thread-safe."""
+        lim_result = "—"
+        try:
+            import urllib.request, json as _json
+            p = load_prefs()
+            lat = float(p.get("loc_lat") or 0)
+            lng = float(p.get("loc_lng") or 0)
+            if lat != 0 and lng != 0:
+                delta = 0.0005
+                query = (f"[out:json][timeout:8];"
+                         f"way[highway][maxspeed]"
+                         f"({lat-delta},{lng-delta},{lat+delta},{lng+delta});"
+                         f"out tags 1;")
+                req = urllib.request.Request(
+                    "https://overpass-api.de/api/interpreter",
+                    data=query.encode(),
+                    headers={"Content-Type": "text/plain",
+                             "User-Agent": "VELOXIS/2.0 traffic-research"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = _json.loads(r.read())
+                elements = data.get("elements", [])
+                if elements:
+                    raw = elements[0].get("tags", {}).get("maxspeed", "")
+                    num = "".join(c for c in raw if c.isdigit())
+                    if num:
+                        lim = int(num)
+                        if "mph" in raw.lower(): lim = round(lim * 1.609)
+                        lim_result = str(lim)
+                    else:
+                        lim_result = "50*"
+                else:
+                    lim_result = "50*"
+        except Exception:
+            lim_result = "—"
+        # All UI writes happen on the main thread via self.after()
+        self.after(0, lambda r=lim_result: [
+            setattr(self, "_road_speed_limit", r),
+            self._show_speed_comparison(v85, r)
+        ])
+
+    def _show_speed_comparison(self, v85, lim_raw):
+        """Show V85 vs speed limit in status bar."""
+        note = ""
+        try:
+            lim_val = int(str(lim_raw).replace("*",""))
+            if v85 and lim_val:
+                diff = v85 - lim_val
+                if diff > 10:   note = f"  ⚠ V85 exceeds limit by {diff:.0f}km/h"
+                elif diff > 0:  note = f"  ↑ V85 slightly above limit"
+                else:           note = f"  ✓ V85 within speed limit"
+        except: pass
+        if self.status_bar:
+            self.status_bar.set(
+                f"Analysis complete ✓  —  V85:{v85}km/h / Limit:{lim_raw}km/h{note}", "idle")
 
     def _snap(self):
         if self._last_frame is None: return
@@ -1308,68 +2257,91 @@ class CalibratePage(Page):
 
 
 # ================================================================
-#  ANALYTICS DASHBOARD
+#  ANALYTICS DASHBOARD  — Advanced
 # ================================================================
 class DashboardPage(Page):
     def __init__(self,master):
-        super().__init__(master); self.grid_rowconfigure(2,weight=1)
+        super().__init__(master)
+        self.grid_rowconfigure(3,weight=1)
         self._ever_shown=False
-        self.page_header("📊","Analytics Dashboard","Embedded charts · zoom · pan · export")
+        self.page_header("📊","Analytics Dashboard","KPI strip · 8 chart types · export")
 
+        # ── KPI summary strip (from summary CSVs) ─────────────
+        kpi_f=ctk.CTkFrame(self,fg_color="transparent")
+        kpi_f.grid(row=1,column=0,padx=32,pady=(10,0),sticky="ew")
+        kpi_f.grid_columnconfigure(list(range(7)),weight=1)
+        self._kpi_cards={}
+        kpi_items=[
+            ("total",  "Total Vehicles", "🚗", ACC_BLUE),
+            ("phf",    "PHF",            "📈", ACC_AMBER),
+            ("v85",    "V85 km/h",       "🚀", ACC_GREEN),
+            ("los",    "LOS",            "🏁", ACC_PURPLE),
+            ("headway","Avg Headway",    "⏱", ACC_TEAL),
+            ("satflow","Sat. Flow",      "🔄", "#fb923c"),
+            ("safety", "Safety Events",  "⚠️", ACC_RED),
+        ]
+        for col,(key,lbl,icon,acc) in enumerate(kpi_items):
+            f=ctk.CTkFrame(kpi_f,corner_radius=10,border_width=1)
+            f.grid(row=0,column=col,padx=(0 if col==0 else 6,0),sticky="ew")
+            ctk.CTkFrame(f,height=3,corner_radius=0,fg_color=acc).pack(fill="x")
+            ctk.CTkLabel(f,text=f"{icon} {lbl}",font=("Segoe UI",8),
+                         text_color="#64748b").pack(pady=(6,0))
+            v=ctk.CTkLabel(f,text="—",font=("Segoe UI",14,"bold"),text_color=acc)
+            v.pack(pady=(0,6))
+            self._kpi_cards[key]=v
+
+        # ── Filter bar ────────────────────────────────────────
         fbar=ctk.CTkFrame(self,corner_radius=12,border_width=1)
-        fbar.grid(row=1,column=0,padx=32,pady=(0,10),sticky="ew")
+        fbar.grid(row=2,column=0,padx=32,pady=(10,0),sticky="ew")
 
-        # Row 1: chart type buttons
         r1=ctk.CTkFrame(fbar,fg_color="transparent"); r1.pack(padx=16,pady=(10,4),fill="x")
         self.cvar=tk.StringVar(value="Daily")
-        for lbl in ["Daily","Hourly","Monthly","Types","Direction","By Zone"]:
+        chart_types=["Daily","Hourly+Speed","Monthly","Types","Speed Dist","LOS Timeline","Direction","TMC Matrix","By Zone"]
+        for lbl in chart_types:
             ctk.CTkRadioButton(r1,text=lbl,variable=self.cvar,value=lbl,
-                               font=("Segoe UI",12),command=self._render_chart
-            ).pack(side="left",padx=(0,14))
+                               font=("Segoe UI",11),command=self._render_chart
+            ).pack(side="left",padx=(0,12))
 
-        # Row 2: filters
         r2=ctk.CTkFrame(fbar,fg_color="transparent"); r2.pack(padx=16,pady=(0,10),fill="x")
-
         ctk.CTkLabel(r2,text="From:",font=("Segoe UI",11)).pack(side="left",padx=(0,4))
         self.sv=tk.StringVar()
-        sv_entry=ctk.CTkEntry(r2,textvariable=self.sv,placeholder_text="YYYY-MM-DD",width=112)
-        sv_entry.pack(side="left",padx=(0,4))
-        ctk.CTkButton(r2,text="📅",width=28,height=28,font=("Segoe UI",12),
+        ctk.CTkEntry(r2,textvariable=self.sv,placeholder_text="YYYY-MM-DD",width=110
+                    ).pack(side="left",padx=(0,4))
+        ctk.CTkButton(r2,text="📅",width=26,height=26,font=("Segoe UI",11),
             fg_color="transparent",border_width=1,
             command=lambda: self._pick_date(self.sv)).pack(side="left",padx=(0,10))
-
         ctk.CTkLabel(r2,text="To:",font=("Segoe UI",11)).pack(side="left",padx=(0,4))
         self.ev=tk.StringVar()
-        ev_entry=ctk.CTkEntry(r2,textvariable=self.ev,placeholder_text="YYYY-MM-DD",width=112)
-        ev_entry.pack(side="left",padx=(0,4))
-        ctk.CTkButton(r2,text="📅",width=28,height=28,font=("Segoe UI",12),
+        ctk.CTkEntry(r2,textvariable=self.ev,placeholder_text="YYYY-MM-DD",width=110
+                    ).pack(side="left",padx=(0,4))
+        ctk.CTkButton(r2,text="📅",width=26,height=26,font=("Segoe UI",11),
             fg_color="transparent",border_width=1,
-            command=lambda: self._pick_date(self.ev)).pack(side="left",padx=(0,14))
-
+            command=lambda: self._pick_date(self.ev)).pack(side="left",padx=(0,12))
         ctk.CTkLabel(r2,text="Session:",font=("Segoe UI",11)).pack(side="left",padx=(0,4))
         self.sess_var=tk.StringVar(value="All")
         self.sess_cb=ctk.CTkComboBox(r2,variable=self.sess_var,values=["All"],
-            width=160,command=lambda _: self._render_chart())
+            width=155,command=lambda _: self._render_chart())
         self.sess_cb.pack(side="left",padx=(0,10))
-
-        ctk.CTkButton(r2,text="Clear filters",width=90,height=28,font=("Segoe UI",11),
+        ctk.CTkButton(r2,text="✕ Clear",width=72,height=26,font=("Segoe UI",11),
             fg_color="transparent",border_width=1,
-            command=self._clear_filters).pack(side="left",padx=(0,8))
-        ctk.CTkButton(r2,text="Refresh",width=80,height=28,font=("Segoe UI",12),
-            command=self._render_chart).pack(side="left")
+            command=self._clear_filters).pack(side="left",padx=(0,6))
+        ctk.CTkButton(r2,text="↺ Refresh",width=80,height=26,font=("Segoe UI",11),
+            command=self._render_chart).pack(side="left",padx=(0,6))
+        ctk.CTkButton(r2,text="💾 PNG",width=72,height=26,font=("Segoe UI",11),
+            fg_color=ACC_TEAL,hover_color="#0d9488",
+            command=self._export_png).pack(side="left")
 
+        # ── Chart canvas ──────────────────────────────────────
         cf=ctk.CTkFrame(self,corner_radius=14,border_width=1)
-        cf.grid(row=2,column=0,padx=32,pady=(0,24),sticky="nsew")
-        # Use grid inside cf so the canvas always fills remaining space
-        cf.grid_rowconfigure(1,weight=1)
-        cf.grid_columnconfigure(0,weight=1)
+        cf.grid(row=3,column=0,padx=32,pady=(10,24),sticky="nsew")
+        cf.grid_rowconfigure(1,weight=1); cf.grid_columnconfigure(0,weight=1)
         tb_f=ctk.CTkFrame(cf,corner_radius=0,height=32)
         tb_f.grid(row=0,column=0,sticky="ew",padx=2,pady=(2,0))
         tb_f.grid_propagate(False)
 
-        dark=ctk.get_appearance_mode()=="Dark"
-        bg=("#0e1117" if dark else "#ffffff")
-        self.fig=Figure(facecolor=bg)
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg = "#111827" if dark else "#ffffff"
+        self.fig = Figure(facecolor=bg)
         self.fig.set_tight_layout(False)
         self.fig.subplots_adjust(left=0.08,right=0.97,top=0.88,bottom=0.18)
         self.ax=self.fig.add_subplot(111)
@@ -1379,25 +2351,58 @@ class DashboardPage(Page):
         self.toolbar=NavigationToolbar2Tk(self.canvas,tb_f)
         self.toolbar.update()
 
-    def _pick_date(self, var):
-        """Simple date picker popup."""
+    # ── KPI strip loader ──────────────────────────────────────
+    def _load_kpis(self):
+        """Load KPI strip metrics — filtered by current session selection."""
+        try:
+            sfiles=glob.glob(os.path.join("data","*_summary.csv"))
+            if not sfiles: return
+            sdf=pd.concat([pd.read_csv(f) for f in sfiles],ignore_index=True)
+            if sdf.empty: return
+
+            # Apply session filter — match same selection as chart area
+            sv = self.sess_var.get()
+            if sv and sv != "All" and "session" in sdf.columns:
+                sdf = sdf[sdf["session"]==sv]
+                if sdf.empty: return
+
+            total = int(sdf["total_vehicles"].sum()) if "total_vehicles" in sdf else 0
+            phf   = f"{sdf['phf'].mean():.2f}"            if "phf" in sdf else "—"
+            v85   = f"{sdf['speed_85th_kmh'].mean():.0f}" if "speed_85th_kmh" in sdf else "—"
+            hdwy  = f"{sdf['avg_headway_sec'].mean():.1f}s" if "avg_headway_sec" in sdf else "—"
+            sat   = f"{int(sdf['saturation_flow_vph'].mean())}" if "saturation_flow_vph" in sdf else "—"
+            sev   = f"{int(sdf['safety_events'].sum())}"   if "safety_events" in sdf else "—"
+            # LOS from last session in filtered set
+            los   = str(sdf["los_letter"].iloc[-1]) if "los_letter" in sdf else "—"
+            los_colours={"A":ACC_GREEN,"B":ACC_GREEN,"C":ACC_TEAL,
+                         "D":ACC_AMBER,"E":ACC_RED,"F":"#7f1d1d","—":"#64748b"}
+            self._kpi_cards["total"].configure(text=str(total))
+            self._kpi_cards["phf"].configure(text=phf)
+            self._kpi_cards["v85"].configure(text=v85)
+            self._kpi_cards["los"].configure(text=los,
+                text_color=los_colours.get(los,"#64748b"))
+            self._kpi_cards["headway"].configure(text=hdwy)
+            self._kpi_cards["satflow"].configure(text=sat)
+            self._kpi_cards["safety"].configure(text=sev)
+        except Exception:
+            pass
+
+    # ── Helpers ───────────────────────────────────────────────
+    def _pick_date(self,var):
         import datetime as dt
-        top = tk.Toplevel(self); top.title("Pick date"); top.geometry("260x200")
+        top=tk.Toplevel(self); top.title("Pick date"); top.geometry("260x200")
         top.configure(bg="#1e2535"); top.resizable(False,False)
-        today = dt.date.today()
+        today=dt.date.today()
         tk.Label(top,text="Enter date (YYYY-MM-DD):",bg="#1e2535",fg="#e8eaf0",
                  font=("Segoe UI",11)).pack(pady=(18,6))
         e=tk.Entry(top,font=("Segoe UI",13),width=16,justify="center")
         e.insert(0,str(today)); e.pack(pady=4)
-        def quick(days):
-            d=today-dt.timedelta(days=days)
-            e.delete(0,"end"); e.insert(0,str(d))
+        def quick(days): d=today-dt.timedelta(days=days); e.delete(0,"end"); e.insert(0,str(d))
         bf=tk.Frame(top,bg="#1e2535"); bf.pack(pady=6)
         for label,days in [("Today",0),("7d",7),("30d",30)]:
             tk.Button(bf,text=label,bg="#2d3748",fg="#94a3b8",relief="flat",
                       command=lambda d=days: quick(d)).pack(side="left",padx=4)
-        def ok():
-            var.set(e.get().strip()); top.destroy(); self._render_chart()
+        def ok(): var.set(e.get().strip()); top.destroy(); self._render_chart()
         tk.Button(top,text="OK",bg="#3b82f6",fg="white",font=("Segoe UI",12),
                   relief="flat",padx=20,command=ok).pack(pady=8)
 
@@ -1405,23 +2410,25 @@ class DashboardPage(Page):
         self.sv.set(""); self.ev.set("")
         self.sess_var.set("All"); self._render_chart()
 
-    def _update_sessions(self, df):
-        """Populate session dropdown from loaded data."""
+    def _update_sessions(self,df):
         if df is None or df.empty or "session" not in df.columns:
             self.sess_cb.configure(values=["All"]); return
-        sessions = ["All"] + sorted(df["session"].dropna().unique().tolist())
+        sessions=["All"]+sorted(df["session"].dropna().unique().tolist())
         self.sess_cb.configure(values=sessions)
 
-    def _style_ax(self):
-        dark=ctk.get_appearance_mode()=="Dark"
-        bg=("#0e1117" if dark else "#ffffff")
-        fg=("#e8eaf0" if dark else "#0f172a")
-        grid=("#1f2937" if dark else "#e2e8f0")
-        self.ax.set_facecolor(bg)
-        self.ax.tick_params(colors="#64748b",labelsize=10)
-        self.ax.title.set_color(fg)
-        for sp in self.ax.spines.values(): sp.set_color(grid)
-        self.ax.grid(True,color=grid,linewidth=0.5,linestyle="--",alpha=0.7)
+    def _style_ax(self, ax=None):
+        if ax is None: ax = self.ax
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg   = "#111827" if dark else "#ffffff"   # slightly lighter than #0e1117
+        grid = "#1f2d3d" if dark else "#e2e8f0"   # brighter grid lines
+        fg   = "#f1f5f9" if dark else "#0f172a"   # brighter text
+        ax.set_facecolor(bg)
+        ax.tick_params(colors="#7a90b0", labelsize=9)
+        ax.title.set_color(fg)
+        ax.title.set_fontweight("bold")
+        for sp in ax.spines.values():
+            sp.set_color(grid); sp.set_linewidth(0.7)
+        ax.grid(True, color=grid, linewidth=0.6, linestyle="--", alpha=0.7)
 
     def _df(self):
         files=glob.glob(os.path.join("data","log_*.csv"))
@@ -1434,9 +2441,7 @@ class DashboardPage(Page):
             df["date"]=df["timestamp"].dt.date
             df["hour"]=df["timestamp"].dt.hour
             df["month"]=df["timestamp"].dt.to_period("M").astype(str)
-        # Update session dropdown with all available sessions
         self._update_sessions(df)
-        # Apply date filters
         s=self.sv.get().strip(); e=self.ev.get().strip()
         if s and "date" in df.columns:
             try: df=df[df["date"]>=datetime.date.fromisoformat(s)]
@@ -1444,153 +2449,384 @@ class DashboardPage(Page):
         if e and "date" in df.columns:
             try: df=df[df["date"]<=datetime.date.fromisoformat(e)]
             except: pass
-        # Apply session filter
-        sess=getattr(self,'sess_var',None)
-        if sess:
-            sv=sess.get()
-            if sv and sv!="All" and "session" in df.columns:
-                df=df[df["session"]==sv]
+        sv=self.sess_var.get()
+        if sv and sv!="All" and "session" in df.columns:
+            df=df[df["session"]==sv]
         return df
 
+    def _export_png(self):
+        from tkinter import filedialog
+        path=filedialog.asksaveasfilename(defaultextension=".png",
+            filetypes=[("PNG","*.png")],initialfile="veloxis_chart.png")
+        if not path: return
+        self.fig.savefig(path,dpi=180,bbox_inches="tight")
+
+    # ── Chart renderer ────────────────────────────────────────
     def _render_chart(self):
-        df=self._df()
-        self.ax.cla()
-        # Re-apply BOTH after cla() — matplotlib resets these on clear
-        self.fig.set_tight_layout(False)
-        self.fig.subplots_adjust(left=0.08,right=0.97,top=0.88,bottom=0.18)
-        self._style_ax()
+        df=self._df(); self._load_kpis()
         dark=ctk.get_appearance_mode()=="Dark"
-        fg=("#e8eaf0" if dark else "#0f172a")
+        bg="#0e1117" if dark else "#ffffff"
+        fg="#e8eaf0" if dark else "#0f172a"
         mut="#64748b"
+
+        # Clear and reset
+        self.fig.clear()
+        self.fig.set_facecolor(bg)
+        self.fig.set_tight_layout(False)
+
         chart=self.cvar.get()
-        if df.empty:
-            self.ax.text(0.5,0.5,"No data yet. Run detection first.",
-                ha="center",va="center",color=mut,fontsize=14,transform=self.ax.transAxes)
-        elif chart=="Daily" and "date" in df.columns:
-            c=df.groupby("date").size()
-            bars=self.ax.bar(range(len(c)),c.values,color=ACC_BLUE,alpha=0.85,width=0.7)
-            self.ax.set_xticks(range(len(c)))
-            self.ax.set_xticklabels([str(d) for d in c.index],rotation=30,ha="right",fontsize=9)
-            self.ax.set_title("Daily Vehicle Count",color=fg,fontsize=13,pad=10)
-            self.ax.set_ylabel("Vehicles",color=mut)
+
+        # ── helper: add value labels on bars ─────────────────
+        def _bar_labels(ax,bars,color=mut,fmt="{:.0f}",rot=0):
             for b in bars:
                 h=b.get_height()
-                if h>0: self.ax.text(b.get_x()+b.get_width()/2,h+.3,str(int(h)),
-                                     ha="center",va="bottom",color=mut,fontsize=8)
-        elif chart=="Hourly" and "hour" in df.columns:
-            c=df.groupby("hour").size().reindex(range(24),fill_value=0)
-            self.ax.bar(c.index,c.values,color=ACC_AMBER,alpha=0.85,width=0.8)
-            self.ax.set_xticks(range(0,24,2))
-            self.ax.set_xticklabels([f"{h:02d}:00" for h in range(0,24,2)],rotation=30,ha="right",fontsize=9)
-            self.ax.set_title("Traffic by Hour of Day",color=fg,fontsize=13,pad=10)
-            self.ax.set_ylabel("Vehicles",color=mut)
-        elif chart=="Monthly" and "month" in df.columns:
-            c=df.groupby("month").size()
-            self.ax.bar(range(len(c)),c.values,color=ACC_GREEN,alpha=0.85,width=0.7)
-            self.ax.set_xticks(range(len(c)))
-            self.ax.set_xticklabels(c.index.astype(str),rotation=20,ha="right",fontsize=10)
-            self.ax.set_title("Monthly Trend",color=fg,fontsize=13,pad=10)
-            self.ax.set_ylabel("Vehicles",color=mut)
-        elif chart=="Types" and "vehicle_type" in df.columns:
-            c=df["vehicle_type"].value_counts()
-            cols=[ACC_BLUE,ACC_AMBER,ACC_RED,ACC_GREEN,ACC_PURPLE,ACC_TEAL,"#fb923c"][:len(c)]
-            _,_,auts=self.ax.pie(c.values,labels=c.index,autopct="%1.0f%%",colors=cols,
-                startangle=140,wedgeprops={"linewidth":0.5,"edgecolor":"#0e1117"},
-                textprops={"color":fg,"fontsize":11})
-            for at in auts: at.set_color("#0e1117"); at.set_fontsize(10)
-            self.ax.set_title("Vehicle Type Distribution",color=fg,fontsize=13,pad=10)
-        elif chart=="Direction":
-            dark = ctk.get_appearance_mode()=="Dark"
-            chart_bg = "#0e1117" if dark else "#ffffff"
-            if "direction" not in df.columns or df.empty:
-                self.ax.text(0.5,0.5,
-                    "No direction data yet.\nRun detection first.",
-                    ha="center",va="center",color=mut,fontsize=13,
-                    transform=self.ax.transAxes)
-            else:
-                fwd = df[df["direction"].str.contains("FWD|Forward|→",na=False,regex=True)]
-                bwd = df[df["direction"].str.contains("BWD|Backward|←",na=False,regex=True)]
-                # Check if session filter is active
-                sess = getattr(self,'sess_var',None)
-                sess_val = sess.get() if sess else "All"
+                if h>0:
+                    ax.text(b.get_x()+b.get_width()/2, h+max(h*0.01,0.3),
+                            fmt.format(h), ha="center", va="bottom",
+                            color=color, fontsize=8, rotation=rot)
 
-                if sess_val != "All" and "session" in df.columns:
-                    # Session selected — show by vehicle type for that session
-                    types = sorted(df["vehicle_type"].dropna().unique().tolist())
-                    if not types:
-                        self.ax.text(0.5,0.5,"No vehicle data.",ha="center",va="center",
-                            color=mut,fontsize=13,transform=self.ax.transAxes)
-                    else:
-                        fwd_c=[len(fwd[fwd["vehicle_type"]==t]) for t in types]
-                        bwd_c=[len(bwd[bwd["vehicle_type"]==t]) for t in types]
-                        x=list(range(len(types))); w2=0.36
-                        b1=self.ax.bar([i-w2/2 for i in x],fwd_c,w2,
-                                       label="FWD",color=ACC_BLUE,alpha=0.85)
-                        b2=self.ax.bar([i+w2/2 for i in x],bwd_c,w2,
-                                       label="BWD",color=ACC_AMBER,alpha=0.85)
-                        self.ax.set_xticks(x)
-                        self.ax.set_xticklabels(types,rotation=20,ha="right",fontsize=10)
-                        self.ax.set_title(f"Forward vs Backward — {sess_val}",
-                                          color=fg,fontsize=13,pad=10)
-                        self.ax.set_ylabel("Vehicles",color=mut)
-                        self.ax.legend(facecolor=chart_bg,labelcolor=fg,fontsize=10)
-                        for bar in list(b1)+list(b2):
-                            h=bar.get_height()
-                            if h>0: self.ax.text(bar.get_x()+bar.get_width()/2,h+0.2,
-                                str(int(h)),ha="center",va="bottom",color=mut,fontsize=8)
-                else:
-                    # All sessions — show session-wise FWD/BWD totals
-                    if "session" in df.columns:
-                        sessions = sorted(df["session"].dropna().unique().tolist())
-                        if len(sessions) > 1:
-                            fwd_by_sess = [len(fwd[fwd["session"]==s]) for s in sessions]
-                            bwd_by_sess = [len(bwd[bwd["session"]==s]) for s in sessions]
-                            x=list(range(len(sessions))); w2=0.38
-                            b1=self.ax.bar([i-w2/2 for i in x],fwd_by_sess,w2,
-                                           label="FWD",color=ACC_BLUE,alpha=0.85)
-                            b2=self.ax.bar([i+w2/2 for i in x],bwd_by_sess,w2,
-                                           label="BWD",color=ACC_AMBER,alpha=0.85)
-                            short=[s[:12]+"…" if len(s)>14 else s for s in sessions]
-                            self.ax.set_xticks(x)
-                            self.ax.set_xticklabels(short,rotation=30,ha="right",fontsize=9)
-                            self.ax.set_title("Forward vs Backward — All Sessions",
-                                              color=fg,fontsize=13,pad=10)
-                            self.ax.set_ylabel("Vehicles",color=mut)
-                            self.ax.legend(facecolor=chart_bg,labelcolor=fg,fontsize=10)
-                            for bar in list(b1)+list(b2):
-                                h=bar.get_height()
-                                if h>0: self.ax.text(bar.get_x()+bar.get_width()/2,h+0.2,
-                                    str(int(h)),ha="center",va="bottom",color=mut,fontsize=8)
-                        else:
-                            # Only one session — show by vehicle type
-                            types=sorted(df["vehicle_type"].dropna().unique().tolist())
-                            fwd_c=[len(fwd[fwd["vehicle_type"]==t]) for t in types]
-                            bwd_c=[len(bwd[bwd["vehicle_type"]==t]) for t in types]
-                            x=list(range(len(types))); w2=0.36
-                            b1=self.ax.bar([i-w2/2 for i in x],fwd_c,w2,
-                                           label="FWD",color=ACC_BLUE,alpha=0.85)
-                            b2=self.ax.bar([i+w2/2 for i in x],bwd_c,w2,
-                                           label="BWD",color=ACC_AMBER,alpha=0.85)
-                            self.ax.set_xticks(x)
-                            self.ax.set_xticklabels(types,rotation=20,ha="right",fontsize=10)
-                            self.ax.set_title("Forward vs Backward by Vehicle Type",
-                                              color=fg,fontsize=13,pad=10)
-                            self.ax.set_ylabel("Vehicles",color=mut)
-                            self.ax.legend(facecolor=chart_bg,labelcolor=fg,fontsize=10)
-        elif chart=="By Zone" and "zone" in df.columns:
-            c=df.groupby("zone").size().sort_values(ascending=True)
-            if len(c)>1 and "all" not in c.index:
-                self.ax.barh(c.index,c.values,
-                             color=LANE_COLS[:len(c)],alpha=0.85)
-                self.ax.set_title("By Road / Zone",color=fg,fontsize=13,pad=10)
-                self.ax.set_xlabel("Vehicles",color=mut)
+        if df.empty:
+            ax=self.fig.add_subplot(111)
+            self._style_ax(ax)
+            ax.text(0.5,0.5,"No data yet.\nRun a detection session first.",
+                ha="center",va="center",color=mut,fontsize=14,transform=ax.transAxes)
+            self.canvas.draw_idle(); return
+
+        # ── DAILY ─────────────────────────────────────────────
+        if chart=="Daily" and "date" in df.columns:
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.08,right=0.97,top=0.88,bottom=0.22)
+            self._style_ax(ax)
+            c=df.groupby("date").size()
+            x=range(len(c))
+            bars = ax.bar(x, c.values, color=CHART_PALETTE[0], alpha=0.88, width=0.65,
+                          edgecolor="#2563eb", linewidth=0.5)
+            # 7-day rolling average line if enough data
+            if len(c) >= 3:
+                import numpy as np
+                roll = pd.Series(c.values).rolling(min(3, len(c)), min_periods=1).mean()
+                ax.plot(list(x), roll.values, "--",
+                        color=CHART_PALETTE[2], linewidth=2.0, alpha=0.95, label="3-day avg")
+                ax.legend(facecolor=bg, labelcolor=fg, fontsize=9, framealpha=0.5)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels([str(d) for d in c.index],rotation=35,ha="right",fontsize=8)
+            ax.set_title("Daily Vehicle Count",color=fg,fontsize=13,pad=10)
+            ax.set_ylabel("Vehicles",color=mut,fontsize=10)
+            _bar_labels(ax,bars)
+
+        # ── HOURLY + SPEED ────────────────────────────────────
+        elif chart=="Hourly+Speed":
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.09,right=0.92,top=0.88,bottom=0.18)
+            self._style_ax(ax)
+            if "hour" not in df.columns:
+                ax.text(0.5,0.5,"No timestamp data.",ha="center",va="center",
+                    color=mut,fontsize=13,transform=ax.transAxes)
             else:
-                self.ax.text(0.5,0.5,"Draw lanes first\n(Lane Drawing page).",
-                    ha="center",va="center",color=mut,fontsize=13,transform=self.ax.transAxes)
+                c=df.groupby("hour").size().reindex(range(24),fill_value=0)
+                bars=ax.bar(c.index,c.values,color=ACC_BLUE,alpha=0.8,width=0.7,
+                            edgecolor="#1d4ed8",linewidth=0.4,label="Volume")
+                ax.set_ylabel("Vehicles / hour",color=ACC_BLUE,fontsize=10)
+                ax.tick_params(axis='y',colors=ACC_BLUE)
+                # Speed overlay on right axis
+                if "speed_kmh" in df.columns:
+                    spd=df[df["speed_kmh"].notna() & (df["speed_kmh"]>0)]
+                    if not spd.empty:
+                        ax2=ax.twinx()
+                        avg_spd=spd.groupby("hour")["speed_kmh"].mean().reindex(range(24))
+                        ax2.plot(avg_spd.index,avg_spd.values,"o-",
+                                 color=ACC_AMBER,linewidth=2,markersize=4,
+                                 alpha=0.9,label="Avg Speed")
+                        ax2.set_ylabel("Speed (km/h)",color=ACC_AMBER,fontsize=10)
+                        ax2.tick_params(axis='y',colors=ACC_AMBER,labelsize=9)
+                        ax2.spines["right"].set_color(ACC_AMBER)
+                        ax2.grid(False)
+                        # Combined legend
+                        h1,l1=ax.get_legend_handles_labels()
+                        h2,l2=ax2.get_legend_handles_labels()
+                        ax.legend(h1+h2,l1+l2,facecolor=bg,labelcolor=fg,
+                                  fontsize=9,framealpha=0.5,loc="upper left")
+                ax.set_xticks(range(0,24,2))
+                ax.set_xticklabels([f"{h:02d}:00" for h in range(0,24,2)],
+                                   rotation=30,ha="right",fontsize=8)
+                ax.set_title("Hourly Volume + Average Speed",color=fg,fontsize=13,pad=10)
+
+        # ── MONTHLY ───────────────────────────────────────────
+        elif chart=="Monthly" and "month" in df.columns:
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.09,right=0.97,top=0.88,bottom=0.18)
+            self._style_ax(ax)
+            c=df.groupby("month").size()
+            bars = ax.bar(range(len(c)), c.values, color=CHART_PALETTE[1],
+                          alpha=0.88, width=0.65, edgecolor="#b45309", linewidth=0.5)
+            ax.set_xticks(range(len(c)))
+            ax.set_xticklabels(c.index.astype(str),rotation=20,ha="right",fontsize=9)
+            ax.set_title("Monthly Traffic Trend",color=fg,fontsize=13,pad=10)
+            ax.set_ylabel("Vehicles",color=mut,fontsize=10)
+            _bar_labels(ax,bars)
+
+        # ── TYPES (donut + bar side-by-side) ──────────────────
+        elif chart=="Types" and "vehicle_type" in df.columns:
+            self.fig.subplots_adjust(left=0.04,right=0.98,top=0.88,bottom=0.06,wspace=0.3)
+            ax1=self.fig.add_subplot(121)
+            ax2=self.fig.add_subplot(122)
+            self._style_ax(ax1); self._style_ax(ax2)
+            c=df["vehicle_type"].value_counts()
+            cols = CHART_PALETTE[:len(c)]
+            # Donut
+            wedges,_,auts=ax1.pie(c.values,labels=None,autopct="%1.0f%%",colors=cols,
+                startangle=140,pctdistance=0.75,
+                wedgeprops={"linewidth":2,"edgecolor":bg,"width":0.55})
+            for at in auts: at.set_color("#0f172a"); at.set_fontsize(8)
+            ax1.set_title("Type Distribution",color=fg,fontsize=12,pad=8)
+            ax1.legend(c.index,loc="lower center",ncol=2,fontsize=8,
+                       facecolor=bg,labelcolor=fg,framealpha=0.5,
+                       bbox_to_anchor=(0.5,-0.08))
+            # Horizontal bar
+            y=range(len(c))
+            ax2.barh(list(y),c.values,color=cols,alpha=0.85,edgecolor=bg,linewidth=0.3)
+            ax2.set_yticks(list(y))
+            ax2.set_yticklabels(c.index,fontsize=9)
+            ax2.set_xlabel("Count",color=mut,fontsize=9)
+            ax2.set_title("Count by Type",color=fg,fontsize=12,pad=8)
+            for i,v in enumerate(c.values):
+                ax2.text(v+max(c.values)*0.01,i,str(v),va="center",
+                         color=mut,fontsize=8)
+            ax2.grid(axis="x",color="#1f2937" if dark else "#e2e8f0",
+                     linewidth=0.5,linestyle="--",alpha=0.6)
+            ax2.set_facecolor(bg)
+            ax2.tick_params(colors="#64748b",labelsize=9)
+            ax2.title.set_color(fg)
+            for sp in ax2.spines.values():
+                sp.set_color("#1f2937" if dark else "#e2e8f0")
+
+        # ── SPEED DISTRIBUTION ────────────────────────────────
+        elif chart=="Speed Dist":
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.09,right=0.97,top=0.88,bottom=0.16)
+            self._style_ax(ax)
+            if "speed_kmh" not in df.columns:
+                ax.text(0.5,0.5,"No speed data.\nEnable PIXELS_PER_METER or homography.",
+                    ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+            else:
+                spd=df["speed_kmh"].dropna()
+                spd=spd[(spd>0)&(spd<150)]
+                if spd.empty:
+                    ax.text(0.5,0.5,"No valid speed readings yet.",
+                        ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+                else:
+                    import numpy as np
+                    n,bins,patches=ax.hist(spd,bins=30,color=ACC_BLUE,
+                                           alpha=0.75,edgecolor=bg,linewidth=0.4)
+                    # Colour bars above V85
+                    v85p=float(spd.quantile(0.85))
+                    for patch,left in zip(patches,bins[:-1]):
+                        if left>=v85p: patch.set_facecolor(ACC_RED)
+                    # V85 line
+                    ax.axvline(v85p,color=ACC_RED,linewidth=2,linestyle="--",
+                               label=f"V85 = {v85p:.0f} km/h")
+                    # Mean line
+                    mn=float(spd.mean())
+                    ax.axvline(mn,color=ACC_AMBER,linewidth=1.5,linestyle=":",
+                               label=f"Mean = {mn:.0f} km/h")
+                    # Speed limit line if saved
+                    try:
+                        lim=int(load_prefs().get("speed_limit","0") or 0)
+                        if lim>0:
+                            ax.axvline(lim,color=ACC_GREEN,linewidth=1.5,linestyle="-.",
+                                       label=f"Limit = {lim} km/h")
+                    except: pass
+                    ax.legend(facecolor=bg,labelcolor=fg,fontsize=10,framealpha=0.5)
+                    ax.set_title("Speed Distribution",color=fg,fontsize=13,pad=10)
+                    ax.set_xlabel("Speed (km/h)",color=mut,fontsize=10)
+                    ax.set_ylabel("Frequency",color=mut,fontsize=10)
+                    # Annotation
+                    ax.text(0.98,0.95,f"n = {len(spd)} readings",
+                        transform=ax.transAxes,ha="right",va="top",
+                        color=mut,fontsize=9)
+
+        # ── LOS TIMELINE ──────────────────────────────────────
+        elif chart=="LOS Timeline":
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.06,right=0.97,top=0.88,bottom=0.22)
+            self._style_ax(ax)
+            sfiles=glob.glob(os.path.join("data","*_summary.csv"))
+            if not sfiles:
+                ax.text(0.5,0.5,"No summary data yet.\nRun detection sessions first.",
+                    ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+            else:
+                try:
+                    sdf=pd.concat([pd.read_csv(f) for f in sorted(sfiles)],ignore_index=True)
+                    sdf=sdf.dropna(subset=["los_letter"]) if "los_letter" in sdf.columns else sdf
+                    if sdf.empty or "los_letter" not in sdf.columns:
+                        raise ValueError("no LOS data")
+                    los_map={"A":1,"B":2,"C":3,"D":4,"E":5,"F":6}
+                    los_cols_m={"A":ACC_GREEN,"B":"#65a30d","C":ACC_TEAL,
+                                "D":ACC_AMBER,"E":ACC_RED,"F":"#7f1d1d"}
+                    sdf["los_num"]=sdf["los_letter"].map(los_map).fillna(0)
+                    x=range(len(sdf))
+                    # Step line
+                    ax.step(list(x),sdf["los_num"].tolist(),where="mid",
+                            color=ACC_BLUE,linewidth=2,alpha=0.8)
+                    # Coloured scatter
+                    for i,row in sdf.iterrows():
+                        col=los_cols_m.get(str(row.get("los_letter","—")),mut)
+                        ax.scatter(list(x)[list(sdf.index).index(i)],
+                                   row["los_num"],color=col,s=80,zorder=5)
+                    # PHF overlay on right axis
+                    if "phf" in sdf.columns:
+                        ax2=ax.twinx()
+                        ax2.plot(list(x),sdf["phf"].tolist(),"o--",
+                                 color=ACC_AMBER,linewidth=1.5,markersize=4,
+                                 alpha=0.8,label="PHF")
+                        ax2.set_ylabel("PHF",color=ACC_AMBER,fontsize=9)
+                        ax2.tick_params(axis='y',colors=ACC_AMBER,labelsize=8)
+                        ax2.set_ylim(0,1.1); ax2.grid(False)
+                        ax2.axhline(0.85,color=ACC_AMBER,linewidth=0.8,
+                                    linestyle=":",alpha=0.5)
+                        ax2.text(len(sdf)-0.5,0.86,"ideal PHF",
+                                 color=ACC_AMBER,fontsize=7,ha="right")
+                    ax.set_yticks([1,2,3,4,5,6])
+                    ax.set_yticklabels(["A","B","C","D","E","F"],
+                                       fontsize=11,fontweight="bold")
+                    ax.set_ylim(0.5,6.5); ax.invert_yaxis()
+                    sessions=sdf.get("session",pd.Series(range(len(sdf)))).tolist()
+                    short=[str(s)[:10]+"…" if len(str(s))>12 else str(s) for s in sessions]
+                    ax.set_xticks(list(x))
+                    ax.set_xticklabels(short,rotation=35,ha="right",fontsize=8)
+                    ax.set_title("LOS + PHF Timeline — Session by Session",
+                                 color=fg,fontsize=13,pad=10)
+                    ax.set_ylabel("Level of Service",color=fg,fontsize=10)
+                    # LOS band legend
+                    for grade,num in los_map.items():
+                        col=los_cols_m.get(grade,mut)
+                        ax.axhspan(num-0.4,num+0.4,alpha=0.06,color=col)
+                except Exception as ex:
+                    ax.text(0.5,0.5,f"Could not load LOS data:\n{ex}",
+                        ha="center",va="center",color=mut,fontsize=11,transform=ax.transAxes)
+
+        # ── DIRECTION ─────────────────────────────────────────
+        elif chart=="Direction":
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.09,right=0.97,top=0.88,bottom=0.22)
+            self._style_ax(ax)
+            chart_bg=bg
+            if "direction" not in df.columns or df.empty:
+                ax.text(0.5,0.5,"No direction data yet.",
+                    ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+            else:
+                fwd=df[df["direction"].str.contains("FWD|Forward|→",na=False,regex=True)]
+                bwd=df[df["direction"].str.contains("BWD|Backward|←",na=False,regex=True)]
+                sess_val=self.sess_var.get()
+                if sess_val!="All" and "session" in df.columns:
+                    types=sorted(df["vehicle_type"].dropna().unique().tolist())
+                    fwd_c=[len(fwd[fwd["vehicle_type"]==t]) for t in types]
+                    bwd_c=[len(bwd[bwd["vehicle_type"]==t]) for t in types]
+                else:
+                    if "session" in df.columns:
+                        types=sorted(df["session"].dropna().unique().tolist())
+                        fwd_c=[len(fwd[fwd["session"]==t]) for t in types]
+                        bwd_c=[len(bwd[bwd["session"]==t]) for t in types]
+                    else:
+                        types=["All"]
+                        fwd_c=[len(fwd)]; bwd_c=[len(bwd)]
+                x=list(range(len(types))); w2=0.36
+                b1=ax.bar([i-w2/2 for i in x],fwd_c,w2,label="FWD",
+                          color=ACC_BLUE,alpha=0.85,edgecolor="#1d4ed8",linewidth=0.4)
+                b2=ax.bar([i+w2/2 for i in x],bwd_c,w2,label="BWD",
+                          color=ACC_AMBER,alpha=0.85,edgecolor="#b45309",linewidth=0.4)
+                short=[str(t)[:12]+"…" if len(str(t))>14 else str(t) for t in types]
+                ax.set_xticks(x); ax.set_xticklabels(short,rotation=30,ha="right",fontsize=9)
+                ax.set_title("Forward vs Backward",color=fg,fontsize=13,pad=10)
+                ax.set_ylabel("Vehicles",color=mut,fontsize=10)
+                ax.legend(facecolor=bg,labelcolor=fg,fontsize=10,framealpha=0.5)
+                _bar_labels(ax,list(b1)+list(b2))
+
+        # ── TMC MATRIX ────────────────────────────────────────
+        elif chart=="TMC Matrix":
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.18,right=0.97,top=0.88,bottom=0.22)
+            self._style_ax(ax)
+            # Load from tmc CSV files
+            tmc_files=glob.glob(os.path.join("data","*_tmc.csv"))
+            if not tmc_files:
+                ax.text(0.5,0.5,
+                    "No TMC data yet.\n\n"
+                    "1. Draw approach zones in Lane Drawing\n"
+                    "2. Enable Zones in Settings\n"
+                    "3. Run detection",
+                    ha="center",va="center",color=mut,fontsize=12,
+                    transform=ax.transAxes,linespacing=2)
+            else:
+                try:
+                    tdf=pd.read_csv(sorted(tmc_files)[-1],index_col=0)
+                    tdf=tdf.drop(columns=["TOTAL"],errors="ignore")
+                    if tdf.empty: raise ValueError("empty")
+                    import numpy as np
+                    data=tdf.values.astype(float)
+                    im=ax.imshow(data,cmap="Blues",aspect="auto")
+                    ax.set_xticks(range(len(tdf.columns)))
+                    ax.set_yticks(range(len(tdf.index)))
+                    ax.set_xticklabels(tdf.columns,rotation=30,ha="right",fontsize=9)
+                    ax.set_yticklabels(tdf.index,fontsize=9)
+                    ax.set_xlabel("Exit Zone →",color=mut,fontsize=10)
+                    ax.set_ylabel("← Entry Zone",color=mut,fontsize=10)
+                    ax.set_title("Turning Movement Count Matrix",color=fg,fontsize=13,pad=10)
+                    # Annotate each cell
+                    for i in range(data.shape[0]):
+                        for j in range(data.shape[1]):
+                            v=int(data[i,j])
+                            txt_col="#0f172a" if v>data.max()*0.5 else fg
+                            ax.text(j,i,str(v) if v>0 else "—",
+                                    ha="center",va="center",
+                                    color=txt_col,fontsize=10,fontweight="bold")
+                    self.fig.colorbar(im,ax=ax,label="Vehicles",shrink=0.8)
+                    # Total row
+                    totals=[int(data[:,j].sum()) for j in range(data.shape[1])]
+                    ax.set_title(
+                        f"TMC Matrix  ·  Total: {int(data.sum())} movements  "
+                        f"·  Peak approach: {tdf.index[data.sum(axis=1).argmax()]}",
+                        color=fg,fontsize=12,pad=10)
+                except Exception as ex:
+                    ax.text(0.5,0.5,f"TMC data error:\n{ex}",
+                        ha="center",va="center",color=mut,fontsize=11,
+                        transform=ax.transAxes)
+
+        # ── BY ZONE ───────────────────────────────────────────
+        elif chart=="By Zone":
+            ax=self.fig.add_subplot(111)
+            self.fig.subplots_adjust(left=0.16,right=0.97,top=0.88,bottom=0.12)
+            self._style_ax(ax)
+            if "zone" not in df.columns:
+                ax.text(0.5,0.5,"No zone data.\nDraw lanes in Lane Drawing page.",
+                    ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+            else:
+                c=df.groupby("zone").size().sort_values(ascending=True)
+                c=c[c.index!="all"] if "all" in c.index else c
+                if c.empty:
+                    ax.text(0.5,0.5,"Only 'all' zone found.\nDraw named lanes first.",
+                        ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+                else:
+                    cols=LANE_COLS[:len(c)]
+                    ax.barh(c.index,c.values,color=cols,alpha=0.85,
+                            edgecolor=bg,linewidth=0.4)
+                    for i,v in enumerate(c.values):
+                        ax.text(v+max(c.values)*0.01,i,str(v),va="center",
+                                color=mut,fontsize=9)
+                    ax.set_title("Volume by Road / Zone",color=fg,fontsize=13,pad=10)
+                    ax.set_xlabel("Vehicles",color=mut,fontsize=10)
+        else:
+            ax=self.fig.add_subplot(111)
+            self._style_ax(ax)
+            ax.text(0.5,0.5,"No data for this chart type.",
+                ha="center",va="center",color=mut,fontsize=13,transform=ax.transAxes)
+
         self.canvas.draw_idle()
 
     def refresh(self):
-        if not self._ever_shown: self._ever_shown=True; self._render_chart()
+        if not self._ever_shown:
+            self._ever_shown=True
+        self._render_chart()
 
 
 # ================================================================
@@ -1640,7 +2876,7 @@ class LanePage(Page):
                          ).pack(side="left",padx=(0,8))
         ctk.CTkButton(r2,text="💾  Save All Lanes",width=160,height=38,
             fg_color="#064e3b",hover_color="#047857",border_width=1,
-            border_color="#047857",text_color=ACC_GREEN,
+            border_color="#047857",text_color=(ACC_GREEN,"#047857"),
             font=("Segoe UI",13,"bold"),command=self._save).pack(side="left")
         self.ll=ctk.CTkLabel(r2,text="0 lanes",font=("Segoe UI",12))
         self.ll.pack(side="left",padx=14)
@@ -1650,6 +2886,7 @@ class LanePage(Page):
         p=filedialog.askopenfilename(initialdir="videos",
             filetypes=[("Video","*.mp4 *.avi *.mov *.mkv"),("All","*.*")])
         if not p: return
+        if self.cap: self.cap.release()   # release previous handle before opening new
         self.cap=cv2.VideoCapture(p)
         tf=max(int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))-1,1)
         self.slider.configure(to=tf,state="normal"); self._seek(0)
@@ -1882,9 +3119,102 @@ class SettingsPage(Page):
             command=lambda: subprocess.Popen([sys.executable,"train_custom_model.py"])
         ).pack(anchor="w",padx=16,pady=(0,14))
 
-        ctk.CTkButton(scroll,text="💾  Save Settings",width=200,height=44,
-            font=("Segoe UI",14,"bold"),corner_radius=10,command=self._save
-        ).pack(anchor="w",pady=(4,0))
+        # ── Study Location ────────────────────────────────────
+        s5=sec("📍  Study Location — Site Tagging")
+        ctk.CTkLabel(s5,font=("Segoe UI",11),text_color="#64748b",
+            text="Tag your data collection site. Coordinates + name saved to every session CSV.",
+            justify="left").pack(anchor="w",padx=16,pady=(0,12))
+
+        loc_r=ctk.CTkFrame(s5,fg_color="transparent"); loc_r.pack(fill="x",padx=16,pady=(0,4))
+        loc_r.grid_columnconfigure(1,weight=1)
+
+        ctk.CTkLabel(loc_r,text="Location name:",font=("Segoe UI",12),
+                     width=140,anchor="w").grid(row=0,column=0,pady=4,sticky="w")
+        self.loc_name=ctk.CTkEntry(loc_r,
+            placeholder_text="e.g. Zindabazar Intersection, Sylhet",width=380)
+        self.loc_name.grid(row=0,column=1,sticky="ew",padx=(0,10))
+
+        ctk.CTkLabel(loc_r,text="Latitude:",font=("Segoe UI",12),
+                     width=140,anchor="w").grid(row=1,column=0,pady=4,sticky="w")
+        lat_f=ctk.CTkFrame(loc_r,fg_color="transparent"); lat_f.grid(row=1,column=1,sticky="ew")
+        self.loc_lat=ctk.CTkEntry(lat_f,placeholder_text="24.8949",width=155)
+        self.loc_lat.pack(side="left",padx=(0,8))
+        ctk.CTkLabel(lat_f,text="Longitude:",font=("Segoe UI",12)).pack(side="left",padx=(0,6))
+        self.loc_lng=ctk.CTkEntry(lat_f,placeholder_text="91.8687",width=155)
+        self.loc_lng.pack(side="left")
+
+        btn_r=ctk.CTkFrame(s5,fg_color="transparent"); btn_r.pack(fill="x",padx=16,pady=(8,4))
+        ctk.CTkButton(btn_r,text="🌐  Lookup Address",width=165,height=36,
+            fg_color="transparent",border_width=1,font=("Segoe UI",12),
+            command=self._geocode_address).pack(side="left",padx=(0,8))
+        ctk.CTkButton(btn_r,text="📍  Use GPS",width=130,height=36,
+            fg_color="transparent",border_width=1,font=("Segoe UI",12),
+            command=self._get_gps).pack(side="left",padx=(0,8))
+        ctk.CTkButton(btn_r,text="🗺  Preview Map",width=140,height=36,
+            fg_color=ACC_BLUE,hover_color="#2563eb",font=("Segoe UI",12),
+            command=self._preview_map).pack(side="left")
+
+        self.loc_status=ctk.CTkLabel(s5,text="",font=("Segoe UI",11),
+                                      text_color="#64748b")
+        self.loc_status.pack(anchor="w",padx=16,pady=(4,0))
+
+        # Site preview — live label that reflects current entry fields (not old saved prefs)
+        self._loc_preview = ctk.CTkLabel(s5,
+            text="",font=("Segoe UI",10),text_color=ACC_TEAL,justify="left")
+        self._loc_preview.pack(anchor="w",padx=16,pady=(6,0))
+        # Update preview whenever entries change
+        def _update_loc_preview(*_):
+            n = self.loc_name.get().strip()
+            la = self.loc_lat.get().strip()
+            ln = self.loc_lng.get().strip()
+            if n or la:
+                self._loc_preview.configure(
+                    text=f"  📍  {n or 'unnamed'}   Lat {la or '—'}  ·  Lng {ln or '—'}")
+            else:
+                self._loc_preview.configure(text="")
+        self.loc_name.bind("<KeyRelease>", _update_loc_preview)
+        self.loc_lat.bind("<KeyRelease>",  _update_loc_preview)
+        self.loc_lng.bind("<KeyRelease>",  _update_loc_preview)
+        _update_loc_preview()   # populate immediately from pre-filled values
+
+        ctk.CTkLabel(s5,text="  Tip: GPS also auto-fills the location name via reverse geocoding.",
+                     font=("Segoe UI",10),text_color="#64748b").pack(anchor="w",padx=16,pady=(4,0))
+
+        # Road type + speed limit
+        rtype_row=ctk.CTkFrame(s5,fg_color="transparent")
+        rtype_row.pack(fill="x",padx=16,pady=(8,0))
+        ctk.CTkLabel(rtype_row,text="Road type:",font=("Segoe UI",12),
+                     width=140,anchor="w").pack(side="left")
+        self.road_type_cb=ctk.CTkComboBox(rtype_row,width=220,
+            values=["Urban arterial","Urban collector","Rural highway",
+                    "Residential","Signalized intersection","Unsignalized intersection",
+                    "Roundabout","Mid-block section"])
+        self.road_type_cb.set(p.get("road_type","Urban arterial"))
+        self.road_type_cb.pack(side="left",padx=(0,16))
+        ctk.CTkLabel(rtype_row,text="Speed limit (km/h):",
+                     font=("Segoe UI",12)).pack(side="left",padx=(0,6))
+        self.speed_limit_e=ctk.CTkEntry(rtype_row,width=70)
+        self.speed_limit_e.insert(0,p.get("speed_limit","50"))
+        self.speed_limit_e.pack(side="left")
+
+        ctk.CTkLabel(s5,
+            text="  Road type and speed limit are included in map reports and session summaries.",
+            font=("Segoe UI",10),text_color="#64748b").pack(anchor="w",padx=16,pady=(4,14))
+
+        # Load saved location into fields
+        if p.get("loc_name"): self.loc_name.insert(0,p["loc_name"])
+        if p.get("loc_lat"):  self.loc_lat.insert(0,str(p["loc_lat"]))
+        if p.get("loc_lng"):  self.loc_lng.insert(0,str(p["loc_lng"]))
+
+        sf=ctk.CTkFrame(scroll,fg_color="transparent")
+        sf.pack(fill="x",pady=(8,0))
+        ctk.CTkButton(sf,text="💾  Save Settings",width=220,height=46,
+            font=("Segoe UI",14,"bold"),corner_radius=10,
+            fg_color=ACC_BLUE,hover_color="#2563eb",
+            command=self._save
+        ).pack(side="left")
+        ctk.CTkLabel(sf,text="Changes take effect on next detection session.",
+                     font=("Segoe UI",11),text_color="#64748b").pack(side="left",padx=14)
         self._load()
 
     def _load(self):
@@ -1907,6 +3237,149 @@ class SettingsPage(Page):
             self.lpos_a.set(getattr(config,'LINE_POS_A',0.38))
             self.lpos_b.set(getattr(config,'LINE_POS_B',0.70))
         except: pass
+
+    def _geocode_address(self):
+        """Nominatim (OpenStreetMap) geocoding — no API key needed."""
+        name = self.loc_name.get().strip()
+        if not name:
+            self.loc_status.configure(text="Enter a location name first.",
+                                       text_color=ACC_AMBER); return
+        self.loc_status.configure(text="Looking up coordinates…",
+                                   text_color=ACC_AMBER); self.update()
+        try:
+            import urllib.request, json as _json, urllib.parse
+            q   = urllib.parse.quote(name)
+            url = f"https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1"
+            req = urllib.request.Request(
+                url, headers={"User-Agent":"VELOXIS/2.0 traffic-research"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            if data:
+                lat = float(data[0]["lat"])
+                lng = float(data[0]["lon"])
+                disp = data[0].get("display_name","")[:70]
+                self.loc_lat.delete(0,"end"); self.loc_lat.insert(0,f"{lat:.6f}")
+                self.loc_lng.delete(0,"end"); self.loc_lng.insert(0,f"{lng:.6f}")
+                self.loc_status.configure(
+                    text=f"✓ {disp}…", text_color=ACC_GREEN)
+                if hasattr(self, '_loc_preview'): self._update_loc_preview_now()
+            else:
+                self.loc_status.configure(
+                    text="✗ Not found. Try more specific name (e.g. Zindabazar, Sylhet).",
+                    text_color=ACC_RED)
+        except Exception as e:
+            self.loc_status.configure(
+                text=f"✗ Lookup failed (check internet): {e}",
+                text_color=ACC_RED)
+
+    def _get_gps(self):
+        """Try Windows Location API via PowerShell, then reverse-geocode to fill name."""
+        self.loc_status.configure(text="Requesting GPS…",
+                                   text_color=ACC_AMBER); self.update()
+        try:
+            ps = ("Add-Type -AssemblyName System.Device;"
+                  "$w=New-Object System.Device.Location.GeoCoordinateWatcher;"
+                  "$w.Start();Start-Sleep 4;"
+                  "$c=$w.Position.Location;"
+                  "Write-Output \"$($c.Latitude),$($c.Longitude)\"")
+            r = subprocess.run(["powershell","-Command",ps],
+                               capture_output=True,text=True,timeout=12)
+            out = r.stdout.strip()
+            if "," in out:
+                lat_s, lng_s = out.split(",")
+                lat, lng = float(lat_s.strip()), float(lng_s.strip())
+                # Guard against NaN / zero from devices without GPS
+                import math as _math
+                if not (_math.isnan(lat) or _math.isnan(lng) or lat==0 or lng==0):
+                    self.loc_lat.delete(0,"end"); self.loc_lat.insert(0,f"{lat:.6f}")
+                    self.loc_lng.delete(0,"end"); self.loc_lng.insert(0,f"{lng:.6f}")
+                    self.loc_status.configure(
+                        text=f"✓ GPS acquired: {lat:.5f}, {lng:.5f}  — looking up name…",
+                        text_color=ACC_GREEN)
+                    if hasattr(self, '_loc_preview'): self._update_loc_preview_now()
+                    self.update()
+                    # Auto reverse-geocode in background so UI stays responsive
+                    threading.Thread(
+                        target=self._reverse_geocode,
+                        args=(lat, lng), daemon=True).start()
+                    return
+            self.loc_status.configure(
+                text="GPS unavailable — use Lookup from Address instead.",
+                text_color=ACC_AMBER)
+        except Exception:
+            self.loc_status.configure(
+                text="GPS not available on this device — use Lookup.",
+                text_color=ACC_AMBER)
+
+    def _update_loc_preview_now(self):
+        """Force-refresh the live location preview label from current entry values."""
+        n  = self.loc_name.get().strip()
+        la = self.loc_lat.get().strip()
+        ln = self.loc_lng.get().strip()
+        if n or la:
+            self._loc_preview.configure(
+                text=f"  📍  {n or 'unnamed'}   Lat {la or '—'}  ·  Lng {ln or '—'}")
+        else:
+            self._loc_preview.configure(text="")
+
+    def _reverse_geocode(self, lat, lng):
+        """Nominatim reverse geocode — fills location name from GPS coords in English."""
+        try:
+            import urllib.request, json as _json
+            url = (f"https://nominatim.openstreetmap.org/reverse"
+                   f"?lat={lat}&lon={lng}&format=json&zoom=17&addressdetails=1")
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "VELOXIS/2.0 traffic-research",
+                "Accept-Language": "en"   # force English response
+            })
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            addr = data.get("address", {})
+            # Build: "Road/Locality, City" — prefer specific then broad
+            parts = []
+            for key in ("road", "neighbourhood", "suburb", "city_district"):
+                val = addr.get(key, "")
+                if val and val not in parts:
+                    parts.append(val)
+                if len(parts) >= 1:
+                    break
+            # Add city
+            city = (addr.get("city") or addr.get("town") or
+                    addr.get("municipality") or addr.get("county") or "")
+            if city and city not in parts:
+                parts.append(city)
+            name = ", ".join(parts) if parts else data.get("display_name","")[:60]
+            if name:
+                self.after(0, lambda n=name: [
+                    self.loc_name.delete(0,"end"),
+                    self.loc_name.insert(0, n),
+                    self.loc_status.configure(
+                        text=f"✓ GPS + location: {n}",
+                        text_color=ACC_GREEN),
+                    self._update_loc_preview_now()
+                ])
+        except Exception:
+            self.after(0, lambda: self.loc_status.configure(
+                text="✓ GPS acquired — name lookup failed (no internet?)",
+                text_color=ACC_AMBER))
+
+    def _preview_map(self):
+        """Open location in browser — OpenStreetMap, no API key needed."""
+        try:
+            lat = float(self.loc_lat.get().strip() or "0")
+            lng = float(self.loc_lng.get().strip() or "0")
+        except ValueError:
+            self.loc_status.configure(
+                text="Invalid coordinates.", text_color=ACC_RED); return
+        if lat == 0 and lng == 0:
+            self.loc_status.configure(
+                text="Enter coordinates first.", text_color=ACC_AMBER); return
+        import webbrowser
+        # zoom=17 shows intersection-level detail
+        url = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lng}#map=17/{lat}/{lng}"
+        webbrowser.open(url)
+        self.loc_status.configure(
+            text=f"Opened: {lat:.5f}, {lng:.5f}", text_color=ACC_GREEN)
 
     def _save(self):
         try:
@@ -1933,8 +3406,15 @@ class SettingsPage(Page):
                 (r'LINE_POS_B\s*=\s*[\d.]+',         f'LINE_POS_B = {self.lpos_b.get():.2f}'),
             ]: c=re.sub(pat,rep,c)
             with open("config.py","w",encoding="utf-8") as f: f.write(c)
-            save_prefs({"author_name":self.name_e.get().strip() or "Nishan",
-                        "institution":self.inst_e.get().strip() or "SUST · CEE Dept."})
+            save_prefs({
+                "author_name": self.name_e.get().strip() or "Nishan",
+                "institution": self.inst_e.get().strip() or "SUST · CEE Dept.",
+                "loc_name":    self.loc_name.get().strip(),
+                "loc_lat":     self.loc_lat.get().strip(),
+                "loc_lng":     self.loc_lng.get().strip(),
+                "road_type":   self.road_type_cb.get(),
+                "speed_limit": self.speed_limit_e.get().strip() or "50",
+            })
             from tkinter import messagebox; messagebox.showinfo("Saved ✓","Settings saved ✓")
         except Exception as e:
             from tkinter import messagebox; messagebox.showerror("Error",str(e))
@@ -1966,7 +3446,7 @@ class AboutPage(Page):
 
         ctk.CTkLabel(hero, text="VELOXIS",
                      font=("Segoe UI", 34, "bold"),
-                     text_color=ACC_BLUE).grid(row=0, column=1, sticky="w", pady=(26, 2))
+                     text_color=(ACC_BLUE,"#1d4ed8")).grid(row=0, column=1, sticky="w", pady=(26, 2))
         ctk.CTkLabel(hero, text="AI-Powered Traffic Analysis Platform  ·  Bangladesh Edition",
                      font=("Segoe UI", 13)).grid(row=1, column=1, sticky="w")
         ctk.CTkLabel(hero,
@@ -1981,7 +3461,7 @@ class AboutPage(Page):
 
         caps = [
             ("🎯", "Detection",    "YOLOv11 + BoTSORT\nCustom BD model\n45,862 images",  ACC_BLUE),
-            ("🛺", "BD Vehicles",  "Rickshaw · CNG · Car\nMotorcycle · Bus · Truck\nBicycle · Easybike",  ACC_AMBER),
+            ("🛺", "BD Vehicles",  "Rickshaw · CNG · Car\nMoto · Bus · Truck\nBike · Easybike + 7 more",  ACC_AMBER),
             ("📊", "Analytics",    "PHF · Headway\nSaturation flow · V85\nCSV · Vissim export", ACC_TEAL),
             ("⚡", "Performance",  "CPU & GPU modes\nReal-time HUD\nHomography speed", ACC_GREEN),
         ]
@@ -2061,7 +3541,7 @@ class AboutPage(Page):
 
         ctk.CTkLabel(nct_inner, text="NextCity Tessera",
                      font=("Segoe UI", 14, "bold"),
-                     text_color=ACC_BLUE).grid(row=0, column=1, sticky="w")
+                     text_color=(ACC_BLUE,"#1d4ed8")).grid(row=0, column=1, sticky="w")
         ctk.CTkLabel(nct_inner,
                      text="VELOXIS is a product of NextCity Tessera — building\n"
                           "intelligent tools for urban mobility, traffic engineering,\n"
@@ -2135,48 +3615,58 @@ class App(ctk.CTk):
         self.grid_columnconfigure(1,weight=1); self.grid_rowconfigure(0,weight=1)
 
         # ── Sidebar ───────────────────────────────────────────
-        sb=ctk.CTkFrame(self,width=234,corner_radius=0)
-        sb.grid(row=0,column=0,sticky="nsew"); sb.grid_propagate(False)
-        sb.grid_rowconfigure(12,weight=1); sb.grid_columnconfigure(0,weight=1)
+        sb = ctk.CTkFrame(self, width=248, corner_radius=0)
+        sb.grid(row=0, column=0, sticky="nsew"); sb.grid_propagate(False)
+        sb.grid_rowconfigure(12, weight=1); sb.grid_columnconfigure(0, weight=1)
 
-        # Logo block
-        lf=ctk.CTkFrame(sb,corner_radius=14,border_width=1)
-        lf.grid(row=0,column=0,padx=14,pady=(20,6),sticky="ew")
-        li=ctk.CTkFrame(lf,fg_color="transparent"); li.pack(padx=14,pady=12,fill="x")
-        ic=ctk.CTkFrame(li,width=42,height=42,corner_radius=10)
-        ic.pack(side="left",padx=(0,10)); ic.pack_propagate(False)
-        ctk.CTkLabel(ic,text="🚦",font=("Segoe UI",20)
-                    ).place(relx=0.5,rely=0.5,anchor="center")
-        ctk.CTkLabel(li,text="VELOXIS",font=("Segoe UI",15,"bold")
-                    ).pack(anchor="w")
-        ctk.CTkLabel(li,text="by NextCity Tessera · v1.0",font=("Segoe UI",9)
-                    ).pack(anchor="w")
+        # Logo block — thick accent bar + icon
+        lf = ctk.CTkFrame(sb, corner_radius=0, fg_color="transparent")
+        lf.grid(row=0, column=0, sticky="ew")
+        ctk.CTkFrame(lf, height=4, corner_radius=0,
+                     fg_color=ACC_BLUE).pack(fill="x")
+        li = ctk.CTkFrame(lf, fg_color="transparent")
+        li.pack(padx=16, pady=(16, 16), fill="x")
+        ic = ctk.CTkFrame(li, width=48, height=48, corner_radius=14,
+                          fg_color=(ACC_BLUE, "#1a3a6e"))
+        ic.pack(side="left", padx=(0, 14)); ic.pack_propagate(False)
+        ctk.CTkLabel(ic, text="🚦", font=("Segoe UI", 22)
+                    ).place(relx=0.5, rely=0.5, anchor="center")
+        tx = ctk.CTkFrame(li, fg_color="transparent"); tx.pack(side="left", fill="y")
+        ctk.CTkLabel(tx, text="VELOXIS",
+                     font=("Segoe UI", 17, "bold"),
+                     text_color=(ACC_BLUE, "#6ba4ff")).pack(anchor="w")
+        ctk.CTkLabel(tx, text="NextCity Tessera  ·  v2.0",
+                     font=("Segoe UI", 9), text_color="#4f5e78").pack(anchor="w")
+        # Separator
+        ctk.CTkFrame(sb, height=1, corner_radius=0
+                    ).grid(row=1, column=0, sticky="ew")
 
-        ctk.CTkFrame(sb,height=1).grid(row=1,column=0,padx=14,pady=(4,6),sticky="ew")
-        SLabel(sb,"Navigation").grid(row=2,column=0,padx=22,pady=(0,4),sticky="w")
+        SLabel(sb, "Navigation").grid(row=2, column=0, padx=18, pady=(12, 4), sticky="w")
 
-        nav=[("🏠","Home"),("📹","Live Detection"),("🎬","File Detection"),
-             ("🗺","Lane Drawing"),("📐","Calibrate Speed"),("📊","Analytics"),
-             ("⚙️","Settings"),("ℹ️","About")]
-        self.nav_btns=[]
-        for i,(icon,lbl) in enumerate(nav):
-            btn=NavBtn(sb,icon,lbl,lambda idx=i: self._switch(idx))
-            btn.grid(row=3+i,column=0,padx=10,pady=2,sticky="ew")
+        nav = [("🏠", "Home"), ("📹", "Live Detection"), ("🎬", "File Detection"),
+               ("🗺", "Lane Drawing"), ("📐", "Calibrate Speed"), ("📊", "Analytics"),
+               ("⚙️", "Settings"), ("ℹ️", "About")]
+        self.nav_btns = []
+        for i, (icon, lbl) in enumerate(nav):
+            btn = NavBtn(sb, icon, lbl, lambda idx=i: self._switch(idx))
+            btn.grid(row=3 + i, column=0, padx=8, pady=1, sticky="ew")
             self.nav_btns.append(btn)
 
-        ctk.CTkFrame(sb,height=1).grid(row=12,column=0,padx=14,pady=6,sticky="ew")
+        ctk.CTkFrame(sb, height=1, corner_radius=0
+                    ).grid(row=12, column=0, sticky="ew", padx=0, pady=(4, 0))
 
         # Refresh button
-        ctk.CTkButton(sb,text="🔄  Refresh App",height=36,
-            fg_color="transparent",border_width=1,
-            font=("Segoe UI",12),corner_radius=10,
+        ctk.CTkButton(sb, text="🔄  Refresh App", height=36,
+            fg_color="transparent", border_width=1,
+            border_color=("#c7d6f0", "#2a3a55"),
+            font=("Segoe UI", 11), corner_radius=10,
             command=self._refresh
-        ).grid(row=13,column=0,padx=14,pady=(0,4),sticky="ew")
+        ).grid(row=13,column=0,padx=12,pady=(8,4),sticky="ew")
 
         # Theme toggle
         tr=ctk.CTkFrame(sb,fg_color="transparent")
         tr.grid(row=14,column=0,padx=14,pady=(0,6),sticky="ew")
-        ctk.CTkLabel(tr,text="☀️",font=("Segoe UI",14)).pack(side="left",padx=(6,6))
+        ctk.CTkLabel(tr,text="☀️",font=("Segoe UI",13)).pack(side="left",padx=(4,6))
         self.theme_sw=ctk.CTkSwitch(tr,text="Light mode",
             button_color=ACC_AMBER,progress_color=ACC_AMBER,
             width=44,height=22,command=self._toggle_theme,
@@ -2184,15 +3674,29 @@ class App(ctk.CTk):
         self.theme_sw.pack(side="left")
         if _THEME=="light": self.theme_sw.select()
 
-        # Author block
-        af=ctk.CTkFrame(sb,fg_color="transparent")
-        af.grid(row=15,column=0,padx=14,pady=(0,18),sticky="ew")
-        ctk.CTkLabel(af,text=f"👨‍💻  {name}",font=("Segoe UI",11,"bold"),
-                     text_color=ACC_BLUE).pack(anchor="w")
-        ctk.CTkLabel(af,text=p.get("institution","SUST · CEE Dept."),
-                     font=("Segoe UI",10)).pack(anchor="w")
-        ctk.CTkLabel(af,text="NextCity Tessera  ·  © 2026",font=("Segoe UI",9)
-                    ).pack(anchor="w",pady=(2,0))
+        # Author block — avatar + info
+        af = ctk.CTkFrame(sb, fg_color="transparent", corner_radius=10)
+        af.grid(row=15, column=0, padx=12, pady=(0, 18), sticky="ew")
+        ctk.CTkFrame(af, height=1, corner_radius=0
+                    ).pack(fill="x", pady=(0, 10))
+        av_row = ctk.CTkFrame(af, fg_color="transparent")
+        av_row.pack(fill="x", padx=6)
+        # Avatar circle
+        av = ctk.CTkFrame(av_row, width=34, height=34, corner_radius=17,
+                          fg_color=(ACC_BLUE, "#1a3a6e"))
+        av.pack(side="left", padx=(0, 10)); av.pack_propagate(False)
+        ctk.CTkLabel(av, text=name[0].upper() if name else "N",
+                     font=("Segoe UI", 14, "bold"),
+                     text_color="white").place(relx=0.5, rely=0.5, anchor="center")
+        txt = ctk.CTkFrame(av_row, fg_color="transparent")
+        txt.pack(side="left", fill="y")
+        ctk.CTkLabel(txt, text=name, font=("Segoe UI", 11, "bold"),
+                     text_color=(ACC_BLUE, "#6ba4ff")).pack(anchor="w")
+        ctk.CTkLabel(txt, text=p.get("institution", "SUST · CEE Dept."),
+                     font=("Segoe UI", 9), text_color="#64748b").pack(anchor="w")
+        ctk.CTkLabel(af, text="© 2026 NextCity Tessera",
+                     font=("Segoe UI", 9),
+                     text_color=(ACC_TEAL, "#2fe6d4")).pack(anchor="w", padx=6, pady=(6, 4))
 
         # Status bar
         self.sb2=StatusBar(self)
@@ -2236,7 +3740,7 @@ class App(ctk.CTk):
     def _toggle_theme(self):
         global _THEME
         _THEME="light" if _THEME=="dark" else "dark"
-        ctk.set_appearance_mode(_THEME)   # instant apply
+        ctk.set_appearance_mode(_THEME)
         save_prefs({"theme":_THEME})
 
 
