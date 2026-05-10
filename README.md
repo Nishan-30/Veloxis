@@ -66,7 +66,7 @@ The application was developed as a final-year thesis instrument at the Departmen
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/veloxis.git
+git clone https://github.com/Nishan-30/veloxis.git
 cd veloxis
 
 # First-time setup (installs all dependencies)
