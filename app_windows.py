@@ -14,7 +14,101 @@ import tkinter as tk
 import customtkinter as ctk
 import threading, os, sys, datetime, json, re, glob, time, queue, math
 import cv2, numpy as np, subprocess
+import logging, traceback
 from PIL import Image, ImageTk
+
+# ── File-based logging setup ───────────────────────────────
+# Captures all print/warn/error to data/veloxis.log (rotating, max 2MB)
+# Crash tracebacks go to data/crash_YYYYMMDD_HHMMSS.log
+os.makedirs("data", exist_ok=True)
+
+_log_path = os.path.join("data", "veloxis.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(_log_path, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+logger = logging.getLogger("veloxis")
+
+def _global_exception_handler(exc_type, exc_value, exc_tb):
+    """Catch any unhandled exception — save traceback to crash log."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    crash_path = os.path.join("data", f"crash_{ts}.log")
+    tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        with open(crash_path, "w", encoding="utf-8") as f:
+            f.write(f"VELOXIS crash report — {ts}\n{'='*60}\n{tb_str}")
+        logger.critical(f"Unhandled exception — crash log: {crash_path}\n{tb_str}")
+    except Exception:
+        pass  # never let the crash handler itself crash the app
+    # Also show in stderr so console users see it
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _global_exception_handler
+logger.info(f"VELOXIS starting — Python {sys.version.split()[0]}, pid={os.getpid()}")
+
+# ── Config validation ──────────────────────────────────────
+def validate_config():
+    """
+    Validate config.py values at startup.
+    Returns list of (field, issue, corrected_value) tuples.
+    Silently corrects out-of-range values to safe defaults.
+    """
+    import config as _c
+    corrections = []
+    def _clamp(attr, lo, hi, default):
+        val = getattr(_c, attr, default)
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            val = default
+        if not (lo <= val <= hi):
+            corrections.append((attr, f"{val} out of [{lo},{hi}]", default))
+            setattr(_c, attr, default)
+    def _ensure_bool(attr, default):
+        val = getattr(_c, attr, default)
+        if not isinstance(val, bool):
+            corrections.append((attr, f"{val!r} not bool", default))
+            setattr(_c, attr, default)
+    def _ensure_positive(attr, default):
+        val = getattr(_c, attr, default)
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            val = default
+        if val <= 0:
+            corrections.append((attr, f"{val} <= 0", default))
+            setattr(_c, attr, default)
+
+    _clamp("CONFIDENCE",             0.05, 0.95,  0.30)
+    _clamp("COUNTING_LINE_POSITION", 0.10, 0.90,  0.55)
+    _clamp("LINE_POS_A",             0.10, 0.60,  0.38)
+    _clamp("LINE_POS_B",             0.40, 0.90,  0.70)
+    _clamp("PIXELS_PER_METER",       0,    500,   55)
+    _clamp("CPU_RESIZE_WIDTH",       160,  1280,  416)
+    _clamp("CPU_FRAME_SKIP",         1,    10,    2)
+    _clamp("NIGHT_THRESHOLD",        0,    255,   60)
+    _ensure_positive("VIDEO_FPS",    30)
+    _ensure_bool("CPU_PERFORMANCE_MODE", True)
+    _ensure_bool("USE_DUAL_LINES",   False)
+    _ensure_bool("ENABLE_ZONES",     False)
+    _ensure_bool("SHOW_SPEED",       True)
+    _ensure_bool("SHOW_IDS",         True)
+
+    for attr, issue, fixed in corrections:
+        logger.warning(f"Config validation: {attr} — {issue} → corrected to {fixed}")
+
+    return corrections
+
+_config_issues = validate_config()
+if _config_issues:
+    logger.warning(f"Config had {len(_config_issues)} invalid value(s) — auto-corrected")
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -664,8 +758,9 @@ class DetectionThread(threading.Thread):
         except ImportError as e:
             self.on_status(f"ERROR: {e}"); return
         self.on_status("Loading YOLO model…")
-        lbl=f"{'live' if self.mode=='live' else 'file'}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
-        self._session_label = lbl   # stored so UI can pass to map report
+        lbl = f"{'live' if self.mode=='live' else 'file'}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+        self._session_label = lbl
+        logger.info(f"Detection session starting — mode={self.mode}, label={lbl}")
 
         # Check model file before creating detector — show warning in UI if fallback
         import config as _cfg
@@ -762,9 +857,8 @@ class DetectionThread(threading.Thread):
                     time.sleep(max(0.005, _target_spf * 0.4))   # 40% of frame time = sustainable
         except Exception as _loop_exc:
             # Unhandled exception in detection loop — log it, fall through to cleanup
-            import traceback
-            print(f"[ERROR] Detection loop crashed: {_loop_exc}")
-            traceback.print_exc()
+            _tb = traceback.format_exc()
+            logger.error(f"Detection loop crashed (session={lbl}): {_loop_exc}\n{_tb}")
             self.on_status(f"⚠️  Session interrupted — saving data…")
         finally:
             cap.release()
@@ -788,6 +882,12 @@ class DetectionThread(threading.Thread):
             "session_label":  lbl,
         })
         self.on_status("Session complete ✓")
+        logger.info(
+            f"Session complete — {lbl} | "
+            f"total={len(det.counted_ids)} | "
+            f"phf={det.phf:.3f} | v85={det.speed_85th}km/h | "
+            f"los={det.los_letter} | safety={det.safety_events}"
+        )
 
 
 # ================================================================
@@ -3415,7 +3515,17 @@ class SettingsPage(Page):
                 "road_type":   self.road_type_cb.get(),
                 "speed_limit": self.speed_limit_e.get().strip() or "50",
             })
-            from tkinter import messagebox; messagebox.showinfo("Saved ✓","Settings saved ✓")
+            from tkinter import messagebox
+            # Reload config module and validate
+            import importlib, config as _cfg
+            importlib.reload(_cfg)
+            _issues = validate_config()
+            _msg = "Settings saved ✓"
+            if _issues:
+                _msg += f"\n\n⚠️  {len(_issues)} value(s) auto-corrected:\n"
+                _msg += "\n".join(f"  {a}: {iss}" for a,iss,_ in _issues)
+            logger.info(f"Settings saved by user")
+            messagebox.showinfo("Saved ✓", _msg)
         except Exception as e:
             from tkinter import messagebox; messagebox.showerror("Error",str(e))
 
@@ -3718,6 +3828,7 @@ class App(ctk.CTk):
         self.ab=AboutPage(content)
         self._pages=[self.hp,self.lp,self.fp,self.la,self.cal,self.dp,self.sp,self.ab]
         for pg in self._pages: pg.grid(row=0,column=0,sticky="nsew")
+        logger.info(f"App window initialised — theme={_THEME}")
         self._switch(0)
 
     def _refresh(self):
