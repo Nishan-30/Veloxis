@@ -55,9 +55,9 @@ COLOURS = {
     "car":             ( 57, 197, 187),
     "motorcycle":      (255,  80,  30),
     "rickshaw":        (255, 180,  20),
-    "rickshaw/CNG":    (255, 180,  20),
+    "rickshaw/cng":    (255, 180,  20),
     "cng":             (251, 146,  60),
-    "CNG/auto":        (251, 146,  60),
+    "cng/auto":        (251, 146,  60),
     "bus":             ( 80, 130, 240),
     "truck":           (160,  80, 220),
     "bicycle":         ( 80, 220,  80),
@@ -67,6 +67,8 @@ COLOURS = {
     "leguna":          (100, 200, 255),
     "nosimon":         (255, 150, 100),
     "microbus":        ( 80, 180, 180),
+    "van":             ( 80, 180, 180),   # model class alias for microbus
+    "army vehicle":    (100, 160,  80),   # military/army vehicles
     "pickup":          (180, 130,  80),
     "tempo":           (220, 180,  60),
     "train":           ( 80, 160, 220),
@@ -74,7 +76,7 @@ COLOURS = {
 DEFAULT_COLOUR  = (180, 180, 180)
 DIR_FORWARD     = "FWD"
 DIR_BACKWARD    = "BWD"
-NEAR_MISS_PX    = 25
+NEAR_MISS_PX    = 60   # wider for BD overhead camera (25 caused false positives)
 NEAR_MISS_SPEED = 8
 BRAKE_DROP_KMH  = 18
 
@@ -85,8 +87,8 @@ def _corrected_vtype(raw_cls, box_w, box_h, frame_w, frame_h, class_names=None):
     Custom model class names take priority over COCO fallback.
     """
     if class_names and raw_cls in class_names:
-        name = str(class_names[raw_cls])
-        # Heuristic: small area 'truck' detections are likely CNGs
+        name = str(class_names[raw_cls]).lower()  # always lowercase for COLOURS lookup
+        # Heuristic: small area 'truck' detections are likely CNGs (COCO fallback path)
         if name == "truck":
             if (box_w * box_h) / max(frame_w * frame_h, 1) < 0.04:
                 return "cng"
@@ -168,16 +170,19 @@ class VehicleDetector:
         self._counted_fwd  = set()
         self.frame_no      = 0
         self.session_label = session_label
+        # Accuracy benchmark counters
+        self.raw_det_total = 0    # total raw detections across all frames
+        self.track_total    = 0     # total unique tracks processed
 
         # ── Approach zone pre-registration (Bug 5 fix) ────────
         # Tracks seen in approach zone (above counting line) are pre-registered.
         # If YOLO misses them exactly at the line, they still get counted
         # when they reappear on the far side.
         # approach_zone_frac: fraction of frame height above counting line to monitor
-        APPROACH_ZONE_FRAC = 0.20   # 20% above line = generous detection window
+        APPROACH_ZONE_FRAC = 0.30   # 30% — wider for BD overhead cam
         self._approach_zone_frac = APPROACH_ZONE_FRAC
         self._seen_approaching   = {}  # effective_tid → frame_no when last seen approaching
-        self._approach_max_age   = 45  # frames — drop approach record after ~1.5s
+        self._approach_max_age   = 90  # frames — slow BD traffic needs ~3s window
 
         # ── Re-ID cache (prevents double-counting re-entrants) ─
         self._reid_cache   = {}
@@ -387,6 +392,8 @@ class VehicleDetector:
             )[0]
 
             n_det = len(results.boxes) if results.boxes is not None else 0
+            # Increment benchmark counter for raw detections
+            self.raw_det_total += n_det
             # Debug: detection count + confidence shown top-right
             cv2.putText(frame, f"Det:{n_det} Conf:{_conf:.2f} Trk:{len(self.counted_ids)}",
                         (w-240, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,100), 1)
@@ -454,9 +461,26 @@ class VehicleDetector:
             if speed_kmh:
                 self.prev_speeds[effective_tid] = speed_kmh
 
-            # Direction (FWD = moving down frame, BWD = moving up)
-            prev_cy_ = self.prev_cy.get(effective_tid)
-            direction = DIR_FORWARD if (prev_cy_ is None or cy >= prev_cy_) else DIR_BACKWARD
+            # Direction — use signed-distance (sd) from counting line.
+            # sd > 0 = one side, sd < 0 = other side.
+            # Works for ANY line angle: horizontal, vertical, diagonal.
+            # cy-slope approach failed for left-right traffic (cy barely changes).
+            lp1_dir, lp2_dir, _lbl_dir = lines[0]
+            _dxd = lp2_dir[0] - lp1_dir[0]; _dyd = lp2_dir[1] - lp1_dir[1]
+            _lend = max(math.sqrt(_dxd**2 + _dyd**2), 1)
+            _sd_curr = (_dxd*(cy - lp1_dir[1]) - _dyd*(cx - lp1_dir[0])) / _lend
+            _sd_prev_dir = getattr(self, f"_d_{effective_tid}_A", None)
+            if _sd_prev_dir is not None and abs(_sd_prev_dir - _sd_curr) > 0.5:
+                # Positive→negative = moved toward top/left = FWD
+                direction = DIR_FORWARD if _sd_prev_dir > _sd_curr else DIR_BACKWARD
+            else:
+                # Fallback: cy net displacement for new tracks
+                _cy_fb = self._trk_active.get(tid, {}).get("cy_hist", [])                          if hasattr(self, "_trk_active") else []
+                if len(_cy_fb) >= 2:
+                    direction = DIR_FORWARD if (cy - _cy_fb[0]) >= 0 else DIR_BACKWARD
+                else:
+                    prev_cy_ = self.prev_cy.get(effective_tid)
+                    direction = DIR_FORWARD if (prev_cy_ is None or cy >= prev_cy_) else DIR_BACKWARD
             self.prev_cy[effective_tid] = cy
 
             # Zone tracking for TMC — record entry zone on first appearance
@@ -512,8 +536,8 @@ class VehicleDetector:
                     _curr_sd = (_dx*(cy - lp1[1]) - _dy*(cx - lp1[0])) / _len
                     # Negative sd = past line (FWD), Positive sd = past line (BWD)
                     _frames_since = self.frame_no - self._seen_approaching[effective_tid]
-                    _past_line_fwd = _curr_sd < -8.0   # FWD vehicle past line
-                    _past_line_bwd = _curr_sd > 8.0    # BWD vehicle past line
+                    _past_line_fwd = _curr_sd < -4.0   # FWD vehicle past line
+                    _past_line_bwd = _curr_sd > 4.0    # BWD vehicle past line
                     if (_past_line_fwd or _past_line_bwd) and _frames_since <= self._approach_max_age:
                         _crossed = True
                         self._seen_approaching.pop(effective_tid, None)
@@ -573,6 +597,10 @@ class VehicleDetector:
                     (trk2["ltrb"][0] + trk2["ltrb"][2]) // 2,
                     (trk2["ltrb"][1] + trk2["ltrb"][3]) // 2)
                    for trk2 in tracks]
+            if not hasattr(self, "_nm_active"):
+                self._nm_active = {}
+            self._nm_active = {p: fn for p, fn in self._nm_active.items()
+                               if self.frame_no - fn < 90}
             for i in range(len(pos)):
                 for j in range(i + 1, len(pos)):
                     ta, ax, ay = pos[i]; tb, bx, by = pos[j]
@@ -581,8 +609,8 @@ class VehicleDetector:
                         sp_b = self._estimate_speed(tb, bx, by, self.frame_no) or 0
                         if sp_a > NEAR_MISS_SPEED and sp_b > NEAR_MISS_SPEED:
                             pair = tuple(sorted([ta, tb]))
-                            if not any(e[1] == pair and self.frame_no - e[0] < 90
-                                       for e in self.near_miss_log):
+                            if pair not in self._nm_active:
+                                self._nm_active[pair] = self.frame_no
                                 self.near_miss_log.append((self.frame_no, pair))
                                 self.safety_events += 1
                                 cv2.line(frame, (ax, ay), (bx, by), (0, 0, 255), 1)
@@ -788,6 +816,9 @@ class VehicleDetector:
             "queue_length":   self.queue_length,
             "current_rate":   self.current_rate,
             "peak_rate":      self.peak_rate,
+            # Pipeline audit — for Det/Trk/Eff% cards in live strip
+            "raw_det_total":  self.raw_det_total,
+            "track_total":    self.track_total,
             # Miovision-style
             "phf":            self.phf,
             "avg_headway_sec":self.avg_headway_sec,
@@ -838,10 +869,10 @@ class VehicleDetector:
             self._trk_active  = {}   # tid → track state
             self._trk_next_id = 1
 
-        IOU_MATCH  = 0.18   # minimum IoU after velocity prediction
-        IOU_HIGH   = 0.40   # high-confidence match (skip class check)
-        MAX_LOST   = 15     # frames before track expires (~0.5s at 30fps)
-        MIN_HITS   = 1      # confirm after 1 frame — fast vehicles must not be missed
+        IOU_MATCH  = 0.25   # min IoU to accept a match (was 0.18 — too loose → ID switches)
+        IOU_HIGH   = 0.50   # high-confidence match threshold
+        MAX_LOST   = 25     # frames before expiry (was 15 — too short at frame_skip=2)
+        MIN_HITS   = 1      # confirm after 1 frame
 
         def _iou(a, b):
             ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
@@ -887,7 +918,10 @@ class VehicleDetector:
                 trk_cls  = self._trk_active[tid]['cls']
                 for j, (x1,y1,x2,y2,cls,conf) in enumerate(dets):
                     if cls != trk_cls:
-                        cost[i,j] = 0.98
+                        # Soft penalty — allow cross-class match if IoU is high enough.
+                        # YOLO occasionally flickers between similar classes (car/van/truck).
+                        # Hard penalty (0.98) broke tracks on every flicker → ID explosion.
+                        cost[i,j] = 0.70
                         continue
                     iou = _iou(pred_box, (x1,y1,x2,y2))
                     cost[i,j] = 1.0 - iou
@@ -957,6 +991,7 @@ class VehicleDetector:
         # Step 5: New tracks for unmatched detections
         for j, (x1,y1,x2,y2,cls,conf) in enumerate(dets):
             if j in matched_dets: continue
+            self.track_total += 1  # increment for each new track created
             tid = self._trk_next_id; self._trk_next_id += 1
             self._trk_active[tid] = dict(
                 ltrb=(x1,y1,x2,y2), cls=cls, conf=conf,
@@ -1064,7 +1099,7 @@ class VehicleDetector:
         # Band scaled by frame_skip — at skip=2, vehicles move 2x further per frame
         # so band must be wider to catch vehicles that dwell near line
         _skip_scale = max(_EFFECTIVE_FRAME_SKIP, 1)
-        band = max(length * 0.03 * _skip_scale, 8.0 * _skip_scale)
+        band = max(length * 0.05 * _skip_scale, 12.0 * _skip_scale)
         was_in = getattr(self, f"_b_{key}", False)
         now_in = abs(curr) < band
         setattr(self, f"_b_{key}", now_in)
@@ -1364,6 +1399,7 @@ class VehicleDetector:
             # Auto-export TMC if zone data exists
             if self.turning_counts:
                 self.export_tmc_csv()
+            self.print_benchmark()  # Print accuracy benchmark metrics
             return summary_path
         except Exception as e:
             print(f"[WARN] Could not save session summary: {e}")
@@ -1479,4 +1515,18 @@ class VehicleDetector:
                 detail = "  ".join(f"{k}:{v}" for k, v in vd.items())
                 print(f"  {mv:<25} {total:>4}  ({detail})")
         print(f"\n  Log -> {self.csv_path}")
-        print("=" * 55)
+        print("=" * 55 + "\n")
+        self.print_benchmark()
+
+    def print_benchmark(self):
+        """Print accuracy benchmark metrics - call from print_summary or save_session_summary."""
+        print("\n-- Accuracy Benchmark --")
+        print(f"  Raw detections   : {self.raw_det_total}")
+        print(f"  Unique tracks    : {self.track_total}")
+        unique_vehicles = len(self.counted_ids)
+        print(f"  Counted vehicles : {unique_vehicles}")
+        # Calculate efficiency as ratio of counted to raw detections (lower = filtering works well)
+        if self.raw_det_total > 0:
+            efficiency = (unique_vehicles / self.raw_det_total) * 100
+            print(f"  Efficiency       : {efficiency:.1f}% (counted/raw)")
+        print("-" * 30)
